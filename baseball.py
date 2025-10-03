@@ -21,7 +21,7 @@ Quickstart
 3) On first run, if no `players.csv` and `draft_order.csv` are present, 
    sample CSVs will be generated automatically for a demo 8-team, 10-round draft.
 
-4) Visit http://127.0.0.1:5000/ in your browser.
+4) Visit http://bnsldraft.onrender.com/ in your browser.
 
 CSV Schemas
 ===========
@@ -62,15 +62,25 @@ from flask import (
 )
 
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "draft.db"
+
+env_db = os.environ.get("DB_PATH")
+if env_db:
+    DB_PATH = Path(env_db)
+elif Path("/data").exists():
+    DB_PATH = Path("/data/draft.db")
+else:
+    DB_PATH = APP_DIR / "draft.db"   # ← local default
+
+# Make sure /data exists so SQLite can create the file there.
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 PLAYERS_CSV = APP_DIR / "players.csv"
 DRAFT_ORDER_CSV = APP_DIR / "draft_order.csv"
 
-
 app = Flask(__name__)
-app.config["DB_PATH"] = str(DB_PATH)
+app.config["DB_PATH"] = str(DB_PATH)   # blueprint reads this
 app.register_blueprint(order_bp)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-change-me")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "bnsldraftsecretkey")
 
 MLB_TEAMS = [
     "Arizona Diamondbacks","Atlanta Braves","Baltimore Orioles","Boston Red Sox",
@@ -82,7 +92,6 @@ MLB_TEAMS = [
     "Seattle Mariners","St. Louis Cardinals","Tampa Bay Rays","Texas Rangers",
     "Toronto Blue Jays","Washington Nationals",
 ]
-
 
 # Map all teams to four test emails (round-robin) so you can exercise the system easily.
 _TEST_EMAILS = [
@@ -386,7 +395,7 @@ def notify_if_new_on_clock():
     body = (
         f"You are on the clock for pick {pick_label} ({team}).\n"
         f"{body_deadline}\n"
-        "Submit your selection at http://127.0.0.1:5000/ (Draft page).\n"
+        "Submit your selection at http://bnsldraft.onrender.com/ (Draft page).\n"
     )
 
     if to_addr:
@@ -951,11 +960,11 @@ def scan_on_clock():
 def healthz():
     return {"ok": True}
 
-
 if __name__ == "__main__":
-    # Helpful banner explaining sample CSVs
     print("\n*** Flask Draft App ***")
     print("If players.csv and draft_order.csv are not present, sample files were generated.")
     print("To reset: delete draft.db and restart.\n")
-    app.run(debug=True)
+
+    port = int(os.environ.get("PORT", "5000"))  # Render sets PORT
+    app.run(host="0.0.0.0", port=port, debug=False)  # bind to all interfaces
 
