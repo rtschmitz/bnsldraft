@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS junk
+.DS_Store
+
+# Local data
+draft.db
+players.csv
+draft_order.csv
+
+# Environment / secrets
+.env
+.env.*
+

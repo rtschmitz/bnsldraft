@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: bnsl-draft
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn baseball:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DB_PATH
+        value: /var/data/draft.db
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+
+  - type: cron
+    name: bnsl-draft-sweeper
+    schedule: "* * * * *"
+    env: docker
+    dockerCommand: >
+      curl -s -X POST https://YOUR-RENDER-URL/tasks/scan_on_clock
+
