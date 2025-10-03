@@ -395,7 +395,7 @@ def notify_if_new_on_clock():
     body = (
         f"You are on the clock for pick {pick_label} ({team}).\n"
         f"{body_deadline}\n"
-        "Submit your selection at http://bnsldraft.onrender.com/ (Draft page).\n"
+        "Submit your selection at http://bnsldraft.onrender.com/\n"
     )
 
     if to_addr:
@@ -676,7 +676,15 @@ function renderPlayers(players) {
       btn.className = 'btn';
       btn.textContent = 'Draft';
       btn.onclick = async () => {
-        btn.disabled = true;
+      // Simple confirmation before drafting
+      const team = state.myTeam || "your team";
+      const ok = window.confirm(`Are you sure you want to draft ${p.name} for ${team}?`);
+      if (!ok) return;
+
+      // Guard: prevent double-submits
+      btn.disabled = true;
+
+      try {
         const resp = await fetch('/api/draft', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -688,9 +696,14 @@ function renderPlayers(players) {
         } else {
           const msg = await resp.text();
           alert('Draft failed: ' + msg);
-          btn.disabled = false;
+          btn.disabled = false; // allow retry
         }
-      };
+      } catch (e) {
+        alert('Network error while drafting. Please try again.');
+        btn.disabled = false;
+      }
+    };
+
       actionCell.appendChild(btn);
     } else if (alreadyOwned) {
       actionCell.innerHTML = '<span class="muted">Owned</span>';
