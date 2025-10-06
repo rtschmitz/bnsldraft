@@ -47,8 +47,8 @@ Database
 
 To reset: delete `draft.db` and restart the app (it will re-import CSVs / regenerate sample CSVs if missing).
 """
-
 from __future__ import annotations
+from datetime import datetime, timedelta   # add timedelta
 import csv
 import os
 import sqlite3
@@ -121,6 +121,169 @@ def init_meta():
     """)
     conn.commit()
     conn.close()
+
+def remove_player_from_all_queues(player_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM draft_queue WHERE player_id = ?", (player_id,))
+    conn.commit()
+    conn.close()
+
+def get_team_queue(team: str) -> list[sqlite3.Row]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT dq.player_id, dq.position, p.name
+          FROM draft_queue dq
+          JOIN players p ON p.id = dq.player_id
+         WHERE dq.team = ?
+         ORDER BY dq.position ASC, dq.id ASC
+    """, (team,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def get_team_queue_top_available(team: str) -> int | None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT p.id
+          FROM draft_queue dq
+          JOIN players p ON p.id = dq.player_id
+         WHERE dq.team = ?
+           AND (p.franchise IS NULL OR p.franchise = '')
+           AND COALESCE(p.eligible,1) = 1
+         ORDER BY dq.position ASC, dq.id ASC
+         LIMIT 1
+    """, (team,))
+    row = cur.fetchone()
+    conn.close()
+    return int(row[0]) if row else None
+
+def set_queue_mode(team: str, use_at_start: bool):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+      INSERT INTO team_prefs(team, use_queue_at_start) VALUES(?, ?)
+      ON CONFLICT(team) DO UPDATE SET use_queue_at_start=excluded.use_queue_at_start
+    """, (team, 1 if use_at_start else 0))
+    conn.commit()
+    conn.close()
+
+def get_queue_mode(team: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT use_queue_at_start FROM team_prefs WHERE team=?", (team,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row[0]) if row else False  # default: end-of-clock
+
+def perform_draft_internal(team: str, player_id: int, draft_order_id: int) -> None:
+    """Bypass session—used for auto-draft from queue. Raises on failure."""
+    conn = get_conn()
+    cur = conn.cursor()
+    # validate availability
+    cur.execute("SELECT franchise, eligible FROM players WHERE id=?", (player_id,))
+    prow = cur.fetchone()
+    if not prow:
+        conn.close()
+        raise RuntimeError("player not found")
+    if prow["franchise"]:
+        conn.close()
+        raise RuntimeError("player already owned")
+    if int(prow["eligible"] or 0) != 1:
+        conn.close()
+        raise RuntimeError("player not eligible")
+
+    # assign
+    cur.execute("UPDATE players SET franchise=? WHERE id=?", (team, player_id))
+    cur.execute(
+        "UPDATE draft_order SET player_id=?, drafted_at=? WHERE id=?",
+        (player_id, datetime.utcnow().isoformat(timespec='seconds'), draft_order_id)
+    )
+    conn.commit()
+    # after successfully updating players + draft_order and committing:
+    try:
+        notify_discord_pick(draft_order_id)
+    except Exception as e:
+        print(f"[discord] failed: {e}")
+    conn.close()
+    # clean queues
+    remove_player_from_all_queues(player_id)
+
+def enforce_queue_actions():
+    """
+    Auto-draft from queues in two phases:
+
+    1) END-OF-CLOCK (default): find the earliest undrafted pick *by order*
+       whose deadline (next pick’s designated time) is in the past. If that
+       team uses end-of-clock mode and has a queued player, draft them now.
+
+    2) START-OF-CLOCK: for the team currently on the clock, if they use
+       start-of-clock and have a queued player, draft immediately.
+    """
+    # Use helpers from the order blueprint (we already depend on it)
+    from draft_order_page import (
+        _load_picks_overrides_and_designated,
+        get_current_pick_info,
+        EASTERN,
+    )
+
+    now = datetime.now(tz=EASTERN)
+
+    # Load ordered picks and their designated times (override-or-base)
+    picks, designated = _load_picks_overrides_and_designated()
+    if not picks:
+        return
+
+    # Build the "next pick deadline" array
+    next_deadlines = []
+    for i in range(len(picks)):
+        if i + 1 < len(picks):
+            next_deadlines.append(designated[i + 1])
+        else:
+            # last pick effectively never misses
+            next_deadlines.append(designated[i] + timedelta(days=36500))
+
+    # ---- Phase 1: END-OF-CLOCK enforcement (critical bugfix) ----
+    # Scan in strict order; if the earliest undrafted pick is past its deadline,
+    # and that team uses end mode and has a queued player, draft it now.
+    for i, rec in enumerate(picks):
+        if rec["player_id"]:
+            continue  # already drafted
+        deadline = next_deadlines[i]
+        if now >= deadline:
+            team = rec["team"]
+            if not get_queue_mode(team):  # False => end-of-clock (default)
+                pid = get_team_queue_top_available(team)
+                if pid:
+                    try:
+                        perform_draft_internal(team, pid, int(rec["id"]))
+                    finally:
+                        # Advance notifications; failures shouldn’t block the draft
+                        try:
+                            notify_if_new_on_clock()
+                        except Exception as e:
+                            print(f"[notify] failed: {e}")
+            # Only ever process a single pick per enforcement tick
+            break
+
+    # ---- Phase 2: START-OF-CLOCK enforcement ----
+    info = get_current_pick_info()
+    if not info:
+        return
+    team = info["team"]
+    if get_queue_mode(team):  # True => use at start
+        pid = get_team_queue_top_available(team)
+        if pid:
+            try:
+                perform_draft_internal(team, pid, int(info["id"]))
+            finally:
+                try:
+                    notify_if_new_on_clock()
+                except Exception as e:
+                    print(f"[notify] failed: {e}")
+
 
 def get_meta(key: str) -> str | None:
     conn = get_conn()
@@ -252,6 +415,23 @@ def init_db():
             UNIQUE(round, pick) ON CONFLICT IGNORE
         )
     """)
+    # --- Draft queue + prefs ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS draft_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team TEXT NOT NULL,
+            player_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(team, player_id) ON CONFLICT IGNORE
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS team_prefs (
+            team TEXT PRIMARY KEY,
+            use_queue_at_start INTEGER NOT NULL DEFAULT 0   -- 0=end-of-clock (default), 1=start-of-clock
+        )
+    """)
 
     # Ensure added columns exist (no-ops if already there)
     cur.execute("PRAGMA table_info(players)")
@@ -339,6 +519,93 @@ OWNER_TO_FULL = {
     "Blue Jays": "Toronto Blue Jays",
     "Nationals": "Washington Nationals",
 }
+
+# --- Discord: team abbreviations for message like "3.1 [TB]: ..."
+TEAM_ABBR = {
+    "Arizona Diamondbacks": "ARI",
+    "Atlanta Braves": "ATL",
+    "Baltimore Orioles": "BAL",
+    "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC",
+    "Chicago White Sox": "CWS",
+    "Cincinnati Reds": "CIN",
+    "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL",
+    "Detroit Tigers": "DET",
+    "Houston Astros": "HOU",
+    "Kansas City Royals": "KC",
+    "Los Angeles Angels": "LAA",
+    "Los Angeles Dodgers": "LAD",
+    "Miami Marlins": "MIA",
+    "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN",
+    "New York Mets": "NYM",
+    "New York Yankees": "NYY",
+    "Oakland Athletics": "OAK",
+    "Philadelphia Phillies": "PHI",
+    "Pittsburgh Pirates": "PIT",
+    "San Diego Padres": "SD",
+    "San Francisco Giants": "SF",
+    "Seattle Mariners": "SEA",
+    "St. Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TB",
+    "Texas Rangers": "TEX",
+    "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSH",
+}
+
+def _discord_post(content: str) -> None:
+    """Post a simple message to Discord via webhook. Uses stdlib only."""
+    url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        print(f"[DISCORD-DRYRUN] {content}")
+        return
+
+    import json, urllib.request
+    data = json.dumps({"content": content}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            # 204 No Content is typical for Discord webhooks
+            if resp.status not in (200, 204):
+                print(f"[DISCORD] non-2xx status: {resp.status}")
+    except Exception as e:
+        print(f"[DISCORD] post failed: {e}")
+
+def notify_discord_pick(draft_order_id: int) -> None:
+    """
+    Look up the just-made pick and send a Discord message like:
+      3.1 [TB]: CF Kenedy Corona [DOB = 2000-03-21]
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 
+          d.id, d.round, d.pick, COALESCE(d.label, printf('%d.%02d', d.round, d.pick)) AS pick_label,
+          d.team,
+          p.name, p.position, p.dob, p.first, p.last
+        FROM draft_order d
+        JOIN players p ON p.id = d.player_id
+        WHERE d.id = ?
+    """, (draft_order_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return
+
+    team_full = row["team"]
+    abbr = TEAM_ABBR.get(team_full, team_full)
+    pick_label = row["pick_label"]
+
+    # Best-effort position & name for the format you want
+    pos = (row["position"] or "").strip() or "—"
+    name = row["name"] or f"{(row['first'] or '').strip()} {(row['last'] or '').strip()}".strip()
+    dob = (row["dob"] or "").strip() or "—"
+
+    # Example: 3.1 [TB]: CF Kenedy Corona [DOB = 2000-03-21]
+    content = f"{pick_label} [{abbr}]: {pos} {name} [DOB = {dob}]"
+    _discord_post(content)
+
 
 def ensure_player_unique_indexes():
     """Deduplicate, then add the UNIQUE indexes required by UPSERT."""
@@ -813,7 +1080,7 @@ def generate_sample_csvs(players_path: Path, order_path: Path):
 # -------------------------
 
 init_db()
-
+init_meta()
 # Count what's already in the DB
 conn_chk = get_conn()
 cur_chk = conn_chk.cursor()
@@ -839,6 +1106,169 @@ if DRAFT_ORDER_CSV.exists() and order_count == 0:
 # -------------------------
 # Routes / API
 # -------------------------
+
+QUEUE_HTML = r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Draft Queue</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
+    a { color: #184a7d; text-decoration: none; }
+    .pill { padding: 6px 10px; border-radius: 999px; background: #f2f2f2; display: inline-block; }
+    .btn { padding: 6px 10px; border: 1px solid #333; background: #fff; border-radius: 6px; cursor: pointer; }
+    .btn[disabled]{opacity:.5; cursor:not-allowed;}
+    ul { list-style: none; padding: 0; }
+    li { display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid #eee; }
+    .name { flex: 1; }
+    .controls { display:flex; gap:6px; }
+    .row { display:flex; gap:16px; align-items:center; margin:12px 0; flex-wrap:wrap;}
+  </style>
+</head>
+<body>
+  <div class="row">
+    <a href="/">← Back to Player Draft</a>
+    <span class="pill">Draft Queue</span>
+    <span id="team-pill" class="pill"></span>
+  </div>
+
+  <div class="row">
+    <label class="pill" style="background:#fff;">
+      <input type="radio" name="mode" id="mode-start"> Use queue at start of clock
+    </label>
+    <label class="pill" style="background:#fff;">
+      <input type="radio" name="mode" id="mode-end"> Use queue at end of clock (default)
+    </label>
+    <button id="save-mode" class="btn">Save Mode</button>
+  </div>
+
+  <ul id="queue-list"></ul>
+
+  <script>
+    const list = document.getElementById('queue-list');
+    const saveModeBtn = document.getElementById('save-mode');
+    const modeStart = document.getElementById('mode-start');
+    const modeEnd = document.getElementById('mode-end');
+    const teamPill = document.getElementById('team-pill');
+
+    let queue = [];
+    let team = "";
+    let useStart = false;
+
+    async function load() {
+      const res = await fetch('/api/queue');
+      if (!res.ok) {
+        if (res.status === 401) {
+          alert('Please login from the main page first.');
+          location.href = '/';
+          return;
+        }
+        const msg = await res.text();
+        alert('Failed to load queue: ' + msg);
+        return;
+      }
+      const data = await res.json();
+      team = data.team;
+      useStart = !!data.use_at_start;
+      queue = data.items || [];
+      render();
+    }
+
+    function render() {
+      teamPill.textContent = team ? ('Team: ' + team) : '';
+      modeStart.checked = useStart;
+      modeEnd.checked = !useStart;
+
+      list.innerHTML = '';
+      queue.forEach((item, idx) => {
+        const li = document.createElement('li');
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = `${idx+1}. ${item.name}`;
+
+        const up = document.createElement('button');
+        up.className = 'btn';
+        up.textContent = '↑';
+        up.disabled = idx === 0;
+        up.onclick = () => move(idx, -1);
+
+        const down = document.createElement('button');
+        down.className = 'btn';
+        down.textContent = '↓';
+        down.disabled = idx === queue.length-1;
+        down.onclick = () => move(idx, +1);
+
+        const del = document.createElement('button');
+        del.className = 'btn';
+        del.textContent = 'Remove';
+        del.onclick = () => remove(item.player_id);
+
+        const ctrls = document.createElement('div');
+        ctrls.className = 'controls';
+        ctrls.appendChild(up);
+        ctrls.appendChild(down);
+        ctrls.appendChild(del);
+
+        li.appendChild(name);
+        li.appendChild(ctrls);
+        list.appendChild(li);
+      });
+    }
+
+    function move(i, delta) {
+      const j = i + delta;
+      if (j < 0 || j >= queue.length) return;
+      [queue[i], queue[j]] = [queue[j], queue[i]];
+      render();
+      saveOrder();
+    }
+
+    async function saveOrder() {
+      const order = queue.map(x => x.player_id);
+      await fetch('/api/queue/reorder', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ order })
+      });
+    }
+
+    async function remove(pid) {
+      const res = await fetch('/api/queue/remove', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ player_id: pid })
+      });
+      if (res.ok) {
+        queue = queue.filter(x => x.player_id !== pid);
+        render();
+      }
+    }
+
+    saveModeBtn.onclick = async () => {
+      useStart = modeStart.checked;
+      await fetch('/api/queue/mode', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ use_at_start: useStart })
+      });
+      alert('Queue mode saved.');
+    };
+
+    load();
+  </script>
+</body>
+</html>
+"""
+
+@app.route("/queue")
+def queue_page():
+    # require login
+    if not session.get("authed_team"):
+        return redirect(url_for("index"))
+    return render_template_string(QUEUE_HTML)
+
 
 INDEX_HTML = r"""
 <!doctype html>
@@ -880,20 +1310,24 @@ INDEX_HTML = r"""
     <span id="current-pick">Loading…</span>
     <span id="picks-progress" class="badge"></span>
   </div>
+<div class="topbar">
+  <label class="pill">Your Team:
+    <select id="team-select" style="margin-left:8px;"></select>
+  </label>
 
-  <div class="topbar">
-    <label class="pill">Your Team:
-      <select id="team-select" style="margin-left:8px;"></select>
-    </label>
-    <label class="pill">
-      <input type="checkbox" id="hide-owned" /> Hide owned players
-    </label>
-    <div class="pill right">
-      <span>Search:</span>
-      <input id="search" type="text" placeholder="Type a player name…" style="border:1px solid #ddd; padding:6px 8px; border-radius:6px; min-width: 260px;" />
-      <span class="muted">(substring match)</span>
-    </div>
+  <button id="login-btn" class="btn" style="margin-left:4px;">Login</button>
+  <a id="queue-link" class="btn" href="/queue" style="margin-left:4px; display:none;">View Draft Queue</a>
+
+  <label class="pill">
+    <input type="checkbox" id="hide-owned" /> Hide owned players
+  </label>
+  <div class="pill right">
+    <span>Search:</span>
+    <input id="search" type="text" placeholder="Type a player name…" style="border:1px solid #ddd; padding:6px 8px; border-radius:6px; min-width: 260px;" />
+    <span class="muted">(substring match)</span>
   </div>
+</div>
+
   <div class="pill" id="login-pill" style="margin-top:8px;">
     <span id="login-status">🔒 Not logged in</span>
   </div>
@@ -925,8 +1359,11 @@ const playersBody = document.getElementById('players-body');
 const searchInput = document.getElementById('search');
 const hideOwned = document.getElementById('hide-owned');
 const teamSelect = document.getElementById('team-select');
+const loginBtn = document.getElementById('login-btn');   // NEW
 const currentPickSpan = document.getElementById('current-pick');
 const picksProgress = document.getElementById('picks-progress');
+const queueLink = document.getElementById('queue-link');
+
 
 let state = {
   search: '',
@@ -947,6 +1384,12 @@ function setSelectOptions(teams) {
   teamSelect.innerHTML = '<option value="">— Select Team —</option>' + teams.map(t => `<option value="${t}">${t}</option>`).join('');
 }
 
+function updateLoginButtonState() {
+  const t = teamSelect.value || '';
+  loginBtn.disabled = !t;
+}
+
+
 async function fetchDraftStatus() {
   try {
     const res = await fetch('/api/draft_status');
@@ -955,11 +1398,13 @@ async function fetchDraftStatus() {
 
     if (data.teams) setSelectOptions(data.teams);
     if (data.selected_team) teamSelect.value = data.selected_team;
+    updateLoginButtonState();
 
     state.myTeam = data.selected_team || null;
     state.currentPick = data.current || null;
     state.authedForSelected = !!data.authed_for_selected;
     state.authedEmail = data.authed_email || "";
+    queueLink.style.display = (state.authedForSelected ? 'inline-block' : 'none');
 
     const loginStatus = document.getElementById('login-status');
     if (state.authedForSelected && state.myTeam) {
@@ -1019,35 +1464,55 @@ function renderPlayers(players) {
       btn.className = 'btn';
       btn.textContent = 'Draft';
       btn.onclick = async () => {
-      // Simple confirmation before drafting
-      const team = state.myTeam || "your team";
-      const ok = window.confirm(`Are you sure you want to draft ${p.name} for ${team}?`);
-      if (!ok) return;
-
-      // Guard: prevent double-submits
-      btn.disabled = true;
-
-      try {
-        const resp = await fetch('/api/draft', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ player_id: p.id })
-        });
-        if (resp.ok) {
-          await fetchDraftStatus();
-          await fetchPlayers();
-        } else {
-          const msg = await resp.text();
-          alert('Draft failed: ' + msg);
-          btn.disabled = false; // allow retry
+        const team = state.myTeam || "your team";
+        const ok = window.confirm(`Are you sure you want to draft ${p.name} for ${team}?`);
+        if (!ok) return;
+        btn.disabled = true;
+        try {
+          const resp = await fetch('/api/draft', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ player_id: p.id })
+          });
+          if (resp.ok) {
+            await fetchDraftStatus();
+            await fetchPlayers();
+          } else {
+            const msg = await resp.text();
+            alert('Draft failed: ' + msg);
+            btn.disabled = false;
+          }
+        } catch (e) {
+          alert('Network error while drafting. Please try again.');
+          btn.disabled = false;
         }
-      } catch (e) {
-        alert('Network error while drafting. Please try again.');
-        btn.disabled = false;
-      }
-    };
-
+      };
       actionCell.appendChild(btn);
+
+    } else if (!alreadyOwned && eligible && state.authedForSelected) {
+      // Not on the clock but logged in → queue controls
+      if (p.in_queue) {
+        actionCell.innerHTML = '<span class="muted">Queued</span>';
+      } else {
+        const qbtn = document.createElement('button');
+        qbtn.className = 'btn';
+        qbtn.textContent = 'Add to queue';
+        qbtn.onclick = async () => {
+          qbtn.disabled = true;
+          const resp = await fetch('/api/queue/add', {
+            method: 'POST',
+            headers: { 'Content-Type':'application/json' },
+            body: JSON.stringify({ player_id: p.id })
+          });
+          if (!resp.ok) {
+            const msg = await resp.text();
+            alert('Could not add to queue: ' + msg);
+          }
+          await fetchPlayers(); // refresh "Queued" badges
+        };
+        actionCell.appendChild(qbtn);
+      }
+
     } else if (alreadyOwned) {
       actionCell.innerHTML = '<span class="muted">Owned</span>';
     } else if (!eligible) {
@@ -1055,6 +1520,7 @@ function renderPlayers(players) {
     } else {
       actionCell.innerHTML = '<span class="muted">—</span>';
     }
+
 const dobText = (p.dob && p.dob.length) ? p.dob :
   ((p.dob_year && p.dob_month && p.dob_day) ? `${String(p.dob_year).padStart(4,'0')}-${String(p.dob_month).padStart(2,'0')}-${String(p.dob_day).padStart(2,'0')}` : '');
 
@@ -1088,36 +1554,45 @@ hideOwned.addEventListener('change', () => { state.hideOwned = hideOwned.checked
 
 teamSelect.addEventListener('change', async () => {
   const t = teamSelect.value || '';
-  // Always set the selected team (this also clears old auth on backend)
+  // Always tell backend which team is selected; this clears any previous auth if different
   await fetch('/api/select_team', { 
     method: 'POST', 
     headers: {'Content-Type':'application/json'}, 
     body: JSON.stringify({ team: t }) 
   });
 
-  // If a team is chosen, prompt for email and try to log in
-  if (t) {
-    const email = window.prompt(`Enter the manager email for ${t} to unlock drafting:`);
-    if (email && email.trim()) {
-      const resp = await fetch('/api/login_team', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ team: t, email: email.trim() })
-      });
-      if (!resp.ok) {
-        const msg = await resp.text();
-        alert('Login failed: ' + msg);
-      }
-    }
+  updateLoginButtonState();
+  await fetchDraftStatus();
+  await fetchPlayers();
+});
+
+loginBtn.addEventListener('click', async () => {
+  const t = teamSelect.value || '';
+  if (!t) {
+    alert('Please select a team first.');
+    return;
+  }
+  const email = window.prompt(`Enter the manager email for ${t} to unlock drafting:`);
+  if (!email || !email.trim()) return;
+
+  const resp = await fetch('/api/login_team', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ team: t, email: email.trim() })
+  });
+  if (!resp.ok) {
+    const msg = await resp.text();
+    alert('Login failed: ' + msg);
   }
   await fetchDraftStatus();
   await fetchPlayers();
 });
 
-
 async function boot() {
   await fetchDraftStatus().catch(() => {});
+  updateLoginButtonState();  // NEW
   await fetchPlayers().catch((e) => console.error('fetchPlayers failed:', e));
+
 }
 
 
@@ -1132,6 +1607,91 @@ boot();
 def index():
     return render_template_string(INDEX_HTML)
 
+def _require_authed_team():
+    team = session.get("authed_team")
+    if not team:
+        abort(401, "Not logged in")
+    return team
+
+@app.get("/api/queue")
+def api_queue_get():
+    team = _require_authed_team()
+    rows = get_team_queue(team)
+    return jsonify({
+        "team": team,
+        "use_at_start": get_queue_mode(team),
+        "items": [{"player_id": r["player_id"], "name": r["name"], "position": r["position"]} for r in rows],
+    })
+
+@app.post("/api/queue/add")
+def api_queue_add():
+    team = _require_authed_team()
+    data = request.get_json(force=True, silent=True) or {}
+    pid = int(data.get("player_id") or 0)
+    if pid <= 0:
+        return ("missing player_id", 400)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    # Already owned or ineligible? block adding
+    cur.execute("SELECT franchise, COALESCE(eligible,1) FROM players WHERE id=?", (pid,))
+    pr = cur.fetchone()
+    if not pr:
+        conn.close(); return ("player not found", 404)
+    if pr[0] or int(pr[1]) != 1:
+        conn.close(); return ("player not addable", 409)
+
+    # Next position = max + 1
+    cur.execute("SELECT COALESCE(MAX(position), 0) FROM draft_queue WHERE team=?", (team,))
+    next_pos = int(cur.fetchone()[0]) + 1
+
+    cur.execute("""
+        INSERT OR IGNORE INTO draft_queue(team, player_id, position, created_at)
+        VALUES(?,?,?,?)
+    """, (team, pid, next_pos, datetime.utcnow().isoformat(timespec='seconds')))
+    conn.commit()
+    conn.close()
+    return ("", 204)
+
+@app.post("/api/queue/remove")
+def api_queue_remove():
+    team = _require_authed_team()
+    data = request.get_json(force=True, silent=True) or {}
+    pid = int(data.get("player_id") or 0)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM draft_queue WHERE team=? AND player_id=?", (team, pid))
+    conn.commit()
+    conn.close()
+    return ("", 204)
+
+@app.post("/api/queue/reorder")
+def api_queue_reorder():
+    team = _require_authed_team()
+    data = request.get_json(force=True, silent=True) or {}
+    order = data.get("order") or []
+    if not isinstance(order, list) or not all(isinstance(x, int) for x in order):
+        return ("invalid order", 400)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    # ensure only items from this team get reordered
+    for idx, pid in enumerate(order, start=1):
+        cur.execute("UPDATE draft_queue SET position=? WHERE team=? AND player_id=?", (idx, team, pid))
+    conn.commit()
+    conn.close()
+    return ("", 204)
+
+@app.post("/api/queue/mode")
+def api_queue_mode():
+    team = _require_authed_team()
+    data = request.get_json(force=True, silent=True) or {}
+    use_at_start = bool(data.get("use_at_start"))
+    set_queue_mode(team, use_at_start)
+    return ("", 204)
+
+
+
 @app.get("/api/players")
 def api_players():
     search = (request.args.get("search") or "").strip().lower()
@@ -1139,6 +1699,12 @@ def api_players():
 
     conn = get_conn()
     cur = conn.cursor()
+    authed_team = session.get("authed_team", "")
+    in_queue = set()
+    if authed_team:
+        cur.execute("SELECT player_id FROM draft_queue WHERE team=?", (authed_team,))
+        in_queue = {int(r[0]) for r in cur.fetchall()}
+
     cols = ("id, name, dob, position, franchise, eligible, "
             "mlbamid, first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org")
     q = f"SELECT {cols} FROM players"
@@ -1177,15 +1743,29 @@ def api_players():
             "dob_day": r["dob_day"],
             "dob_year": r["dob_year"],
             "mlb_org": r["mlb_org"],
+            "in_queue": (r["id"] in in_queue),
         })
     return jsonify({"players": players})
 
 
+@app.post("/tasks/enforce_queue")
+def task_enforce_queue():
+    try:
+        enforce_queue_actions()
+        return ("", 204)
+    except Exception as e:
+        return (f"enforce failed: {e}", 500)
 
 
 @app.get("/api/draft_status")
 def api_draft_status():
     try:
+        # Opportunistic queue enforcement on status poll
+        try:
+            enforce_queue_actions()
+        except Exception as _e:
+            pass
+
         cur_pick = get_current_pick()
 
         # totals
@@ -1310,10 +1890,19 @@ def api_draft():
         )
         conn.commit()
         try:
+            notify_discord_pick(int(current["id"]))   # <-- NEW
+        except Exception as e:
+            print(f"[discord] failed: {e}")
+        try:
             notify_if_new_on_clock()
         except Exception as e:
-            # Keep drafting robust even if email fails
             print(f"[notify] failed: {e}")
+        remove_player_from_all_queues(player_id)
+
+        try:
+            enforce_queue_actions()
+        except Exception as e:
+            print(f"[queue] enforce after draft failed: {e}")
 
     except Exception as e:
         conn.rollback()
