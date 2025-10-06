@@ -221,20 +221,26 @@ def fmt_email_et(dt: datetime) -> str:
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             dob TEXT,
             position TEXT,
             franchise TEXT,
-            eligible INTEGER NOT NULL DEFAULT 1
+            eligible INTEGER NOT NULL DEFAULT 1,
+            mlbamid INTEGER,
+            first TEXT,
+            last TEXT,
+            bats TEXT,
+            throws TEXT,
+            dob_month INTEGER,
+            dob_day INTEGER,
+            dob_year INTEGER,
+            mlb_org TEXT
         )
-        """
-    )
-    cur.execute(
-        """
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS draft_order (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             round INTEGER NOT NULL,
@@ -242,12 +248,337 @@ def init_db():
             team TEXT NOT NULL,
             player_id INTEGER,
             drafted_at TEXT,
+            label TEXT,
             UNIQUE(round, pick) ON CONFLICT IGNORE
         )
-        """
-    )
+    """)
+
+    # Ensure added columns exist (no-ops if already there)
+    cur.execute("PRAGMA table_info(players)")
+    pcols = {row[1] for row in cur.fetchall()}
+    for col, typ in [
+        ("mlbamid","INTEGER"),("first","TEXT"),("last","TEXT"),("bats","TEXT"),
+        ("throws","TEXT"),("dob_month","INTEGER"),("dob_day","INTEGER"),
+        ("dob_year","INTEGER"),("mlb_org","TEXT"),
+    ]:
+        if col not in pcols:
+            cur.execute(f"ALTER TABLE players ADD COLUMN {col} {typ}")
+
+    cur.execute("PRAGMA table_info(draft_order)")
+    dcols = {row[1] for row in cur.fetchall()}
+    if "label" not in dcols:
+        cur.execute("ALTER TABLE draft_order ADD COLUMN label TEXT")
+
+    # ---- Unique indexes for idempotent import ----
+    # Unique when mlbamid is present (>0)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS players_unique_mlbamid
+        ON players(mlbamid)
+        WHERE mlbamid IS NOT NULL AND mlbamid > 0
+    """)
+    # Fallback uniqueness by (name,dob) only when mlbamid is missing/0
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS players_unique_name_dob
+        ON players(name, dob)
+        WHERE (mlbamid IS NULL OR mlbamid = 0)
+    """)    
+    # Ensure 'label' exists if table pre-existed
+    cur.execute("PRAGMA table_info(draft_order)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "label" not in cols:
+        cur.execute("ALTER TABLE draft_order ADD COLUMN label TEXT")
+
+    # — Add-on columns for the richer playerlist.csv —
+    # (SQLite: ALTER TABLE ADD COLUMN is idempotent if we first check pragma_table_info)
+    cur.execute("PRAGMA table_info(players)")
+    cols = {row[1] for row in cur.fetchall()}
+    add_cols = []
+    if "mlbamid" not in cols:     add_cols.append(("mlbamid", "INTEGER"))
+    if "first" not in cols:       add_cols.append(("first", "TEXT"))
+    if "last" not in cols:        add_cols.append(("last", "TEXT"))
+    if "bats" not in cols:        add_cols.append(("bats", "TEXT"))
+    if "throws" not in cols:      add_cols.append(("throws", "TEXT"))
+    if "dob_month" not in cols:   add_cols.append(("dob_month", "INTEGER"))
+    if "dob_day" not in cols:     add_cols.append(("dob_day", "INTEGER"))
+    if "dob_year" not in cols:    add_cols.append(("dob_year", "INTEGER"))
+    if "mlb_org" not in cols:     add_cols.append(("mlb_org", "TEXT"))
+    for col, typ in add_cols:
+        cur.execute(f"ALTER TABLE players ADD COLUMN {col} {typ}")
     conn.commit()
     conn.close()
+
+OWNER_TO_FULL = {
+    "Diamondbacks": "Arizona Diamondbacks",
+    "Braves": "Atlanta Braves",
+    "Orioles": "Baltimore Orioles",
+    "Red Sox": "Boston Red Sox",
+    "Cubs": "Chicago Cubs",
+    "White Sox": "Chicago White Sox",
+    "Reds": "Cincinnati Reds",
+    "Guardians": "Cleveland Guardians",
+    "Rockies": "Colorado Rockies",
+    "Tigers": "Detroit Tigers",
+    "Astros": "Houston Astros",
+    "Royals": "Kansas City Royals",
+    "Angels": "Los Angeles Angels",
+    "Dodgers": "Los Angeles Dodgers",
+    "Marlins": "Miami Marlins",
+    "Brewers": "Milwaukee Brewers",
+    "Twins": "Minnesota Twins",
+    "Mets": "New York Mets",
+    "Yankees": "New York Yankees",
+    "Athletics": "Oakland Athletics",
+    "Phillies": "Philadelphia Phillies",
+    "Pirates": "Pittsburgh Pirates",
+    "Padres": "San Diego Padres",
+    "Giants": "San Francisco Giants",
+    "Mariners": "Seattle Mariners",
+    "Cardinals": "St. Louis Cardinals",
+    "Rays": "Tampa Bay Rays",
+    "Rangers": "Texas Rangers",
+    "Blue Jays": "Toronto Blue Jays",
+    "Nationals": "Washington Nationals",
+}
+
+def ensure_player_unique_indexes():
+    """Deduplicate, then add the UNIQUE indexes required by UPSERT."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # 1) Deduplicate by mlbamid (>0): keep the smallest id
+    cur.execute("""
+        DELETE FROM players
+        WHERE mlbamid IS NOT NULL AND mlbamid > 0
+          AND id NOT IN (
+            SELECT MIN(id) FROM players
+            WHERE mlbamid IS NOT NULL AND mlbamid > 0
+            GROUP BY mlbamid
+          )
+    """)
+
+    # 2) Deduplicate by (name, dob) where mlbamid missing/0: keep the smallest id
+    cur.execute("""
+        DELETE FROM players
+        WHERE (mlbamid IS NULL OR mlbamid = 0)
+          AND (name, IFNULL(dob, '')) IN (
+            SELECT name, IFNULL(dob, '')
+            FROM players
+            WHERE (mlbamid IS NULL OR mlbamid = 0)
+            GROUP BY name, IFNULL(dob, '')
+            HAVING COUNT(*) > 1
+          )
+          AND id NOT IN (
+            SELECT MIN(id) FROM players
+            WHERE (mlbamid IS NULL OR mlbamid = 0)
+            GROUP BY name, IFNULL(dob, '')
+          )
+    """)
+
+    # 3) Add UNIQUE indexes (partial) that the UPSERT targets
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS players_unique_mlbamid
+        ON players(mlbamid)
+        WHERE mlbamid IS NOT NULL AND mlbamid > 0
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS players_unique_name_dob
+        ON players(name, dob)
+        WHERE (mlbamid IS NULL OR mlbamid = 0)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def import_players_from_playerlist(path: Path):
+    """
+    Idempotent import w/o SQLite UPSERT:
+      - If MLBAMID > 0 -> upsert on mlbamid
+      - Else           -> upsert on (name, dob)
+    Never overwrites an existing franchise or eligible.
+    """
+    if not path.exists():
+        return
+    conn = get_conn()
+    cur = conn.cursor()
+
+    def safe_update(existing_row, values):
+        # preserve franchise/eligible if already set
+        keep_franchise = existing_row["franchise"]
+        keep_eligible  = int(existing_row["eligible"] or 0)
+
+        cur.execute("""
+            UPDATE players
+               SET name      = ?,
+                   dob       = ?,
+                   position  = ?,
+                   first     = ?,
+                   last      = ?,
+                   bats      = ?,
+                   throws    = ?,
+                   dob_month = ?,
+                   dob_day   = ?,
+                   dob_year  = ?,
+                   mlb_org   = ?,
+                   franchise = COALESCE(NULLIF(?, ''), franchise),
+                   eligible  = ?
+             WHERE id = ?
+        """, (
+            values["name"], values["dob"], values["position"],
+            values["first"], values["last"], values["bats"], values["throws"],
+            values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"],
+            # Only set franchise if incoming has a non-empty value (we pass ''), else keep existing:
+            "",  # incoming franchise is always "" during import; do not clobber existing
+            keep_eligible,  # preserve eligible
+            existing_row["id"],
+        ))
+
+    with path.open(newline='', encoding='utf-8') as f:
+        r = csv.DictReader(f)
+        for row in r:
+            mlbamid = int(row.get("MLBAMID") or 0)
+            name    = (row.get("Name") or "").strip()
+            first   = (row.get("First") or "").strip()
+            last    = (row.get("Last") or "").strip()
+            bats    = (row.get("Bats") or "").strip()
+            throws  = (row.get("Throws") or "").strip()
+            pos     = (row.get("Position") or "").strip()
+            dob_m   = int(row.get("DOB_Month") or 0)
+            dob_d   = int(row.get("DOB_Day") or 0)
+            dob_y   = int(row.get("DOB_Year") or 0)
+            org     = (row.get("MLB org.") or "").strip()
+
+            dob = ""
+            if dob_y and dob_m and dob_d:
+                dob = f"{dob_y:04d}-{dob_m:02d}-{dob_d:02d}"
+
+            values = {
+                "mlbamid": mlbamid if mlbamid > 0 else None,
+                "name": name,
+                "dob": dob or None,
+                "position": pos,
+                "first": first,
+                "last": last,
+                "bats": bats,
+                "throws": throws,
+                "dob_month": dob_m or None,
+                "dob_day": dob_d or None,
+                "dob_year": dob_y or None,
+                "mlb_org": org,
+            }
+
+            if mlbamid > 0:
+                # Upsert on mlbamid
+                cur.execute("SELECT id, franchise, eligible FROM players WHERE mlbamid = ?", (mlbamid,))
+                existing = cur.fetchone()
+                if existing:
+                    safe_update(existing, values)
+                else:
+                    cur.execute("""
+                        INSERT INTO players
+                          (mlbamid, name, dob, position, franchise, eligible,
+                           first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (values["mlbamid"], values["name"], values["dob"], values["position"],
+                          "", 1, values["first"], values["last"], values["bats"], values["throws"],
+                          values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"]))
+            else:
+                # Upsert on (name, dob) when no mlbamid
+                cur.execute("""
+                    SELECT id, franchise, eligible FROM players
+                     WHERE (mlbamid IS NULL OR mlbamid = 0)
+                       AND name = ?
+                       AND ((dob IS NULL AND ? IS NULL) OR dob = ?)
+                """, (values["name"], values["dob"], values["dob"]))
+                existing = cur.fetchone()
+                if existing:
+                    safe_update(existing, values)
+                else:
+                    cur.execute("""
+                        INSERT INTO players
+                          (mlbamid, name, dob, position, franchise, eligible,
+                           first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (None, values["name"], values["dob"], values["position"],
+                          "", 1, values["first"], values["last"], values["bats"], values["throws"],
+                          values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"]))
+
+    conn.commit()
+    conn.close()
+
+
+
+import re
+
+_RP_NORMAL = re.compile(r"^\s*(\d+)\.(\d+)\s*$")   # e.g. 1.01
+_RP_COMP   = re.compile(r"^\s*[Cc]\s*(\d+)\.(\d+)\s*$")  # e.g. C2.01
+
+def parse_round_pick_token(token: str) -> dict:
+    """
+    Returns a dict:
+      {
+        "round": int,           # base round number
+        "pick_sort": int,       # integer used for ORDER BY within round
+        "label": str            # original/human label to display
+      }
+    Normal: '1.01' -> round=1, pick_sort=1,  label='1.01'
+    Comp:   'C2.03'-> round=2, pick_sort=30+3, label='C2.03'
+    """
+    s = (token or "").strip()
+    m = _RP_COMP.match(s)
+    if m:
+        r = int(m.group(1))
+        k = int(m.group(2))
+        return {"round": r, "pick_sort": 30 + k, "label": s}  # after 2.30, before 3.01
+    m = _RP_NORMAL.match(s)
+    if m:
+        r = int(m.group(1))
+        k = int(m.group(2))
+        return {"round": r, "pick_sort": k, "label": f"{r}.{str(k).zfill(2)}"}
+    # fallback
+    return {"round": 0, "pick_sort": 0, "label": s}
+
+def import_draft_order_from_pickorder(path: Path, reset: bool = False):
+    """
+    pickorder.csv columns:
+      Overall Pick,Round/Pick,Slot,Owner,Day,Time,Date
+
+    If reset=False (default): upsert rows without touching drafted picks.
+    If reset=True: clear the table first (use only when you truly want to reset a draft).
+    """
+    if not path.exists():
+        return
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if reset:
+        cur.execute("DELETE FROM draft_order")
+
+    with path.open(newline='', encoding='utf-8') as f:
+        r = csv.DictReader(f)
+        for row in r:
+            token = row.get("Round/Pick") or ""
+            owner = row.get("Owner") or row.get("Slot") or ""
+            parsed = parse_round_pick_token(token)  # you already have this
+            rnd, pks, label = parsed["round"], parsed["pick_sort"], parsed["label"]
+            team = normalize_team(owner)
+
+            if rnd > 0 and pks > 0 and team:
+                # Insert new row; if it exists:
+                #  - If undrafted, refresh team/label from CSV
+                #  - If drafted, leave as-is
+                cur.execute("""
+                    INSERT INTO draft_order (round, pick, team, label)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(round, pick) DO UPDATE SET
+                        team  = CASE WHEN draft_order.player_id IS NULL THEN excluded.team  ELSE draft_order.team  END,
+                        label = CASE WHEN draft_order.player_id IS NULL THEN excluded.label ELSE draft_order.label END
+                """, (rnd, pks, team, label))
+
+    conn.commit()
+    conn.close()
+
 
 
 def str_to_bool(x: str) -> bool:
@@ -263,6 +594,10 @@ def normalized_header_map(header: List[str]) -> Dict[str, int]:
         key = h.strip().lower().replace("_", " ")
         idx[key] = i
     return idx
+
+def normalize_team(name: str) -> str:
+    n = (name or "").strip()
+    return OWNER_TO_FULL.get(n, n)
 
 
 def import_players_from_csv(path: Path):
@@ -478,12 +813,8 @@ def generate_sample_csvs(players_path: Path, order_path: Path):
 # -------------------------
 
 init_db()
-init_meta()
 
-# Generate samples if missing
-generate_sample_csvs(PLAYERS_CSV, DRAFT_ORDER_CSV)
-
-# Import CSVs only when DB is empty
+# Count what's already in the DB
 conn_chk = get_conn()
 cur_chk = conn_chk.cursor()
 cur_chk.execute("SELECT COUNT(*) FROM players")
@@ -492,10 +823,17 @@ cur_chk.execute("SELECT COUNT(*) FROM draft_order")
 order_count = cur_chk.fetchone()[0]
 conn_chk.close()
 
-if players_count == 0 and PLAYERS_CSV.exists():
-    import_players_from_csv(PLAYERS_CSV)
-if order_count == 0 and DRAFT_ORDER_CSV.exists():
-    import_draft_order_from_csv(DRAFT_ORDER_CSV)
+# Import players (your new manual upsert version is idempotent, so this is safe if you want)
+if PLAYERS_CSV.exists() and players_count == 0:
+    import_players_from_playerlist(PLAYERS_CSV)
+
+# Import draft order ONLY when the table is empty
+if DRAFT_ORDER_CSV.exists() and order_count == 0:
+    import_draft_order_from_pickorder(DRAFT_ORDER_CSV)
+
+# Optional: allow an explicit reset via env var
+#if os.environ.get("RESET_DRAFT_ORDER", "").lower() in ("1","true","yes"):
+#    import_draft_order_from_pickorder(DRAFT_ORDER_CSV, reset=True)
 
 
 # -------------------------
@@ -562,16 +900,21 @@ INDEX_HTML = r"""
 
 
   <table>
-    <thead>
-      <tr>
-        <th style="width:28%;">Player</th>
-        <th style="width:12%;">DOB</th>
-        <th style="width:10%;">Pos</th>
-        <th style="width:25%;">Franchise</th>
-        <th style="width:10%;">Eligible</th>
-        <th style="width:15%;">Action</th>
-      </tr>
-    </thead>
+<thead>
+  <tr>
+    <th style="width:8%;">MLBAMID</th>
+    <th style="width:16%;">Name</th>
+    <th style="width:10%;">First</th>
+    <th style="width:10%;">Last</th>
+    <th style="width:6%;">Bats</th>
+    <th style="width:6%;">Throws</th>
+    <th style="width:8%;">Pos</th>
+    <th style="width:12%;">DOB</th>
+    <th style="width:14%;">MLB Org</th>
+    <th style="width:10%;">Owned By</th>
+    <th style="width:10%;">Action</th>
+  </tr>
+</thead>
     <tbody id="players-body"></tbody>
   </table>
 
@@ -712,14 +1055,22 @@ function renderPlayers(players) {
     } else {
       actionCell.innerHTML = '<span class="muted">—</span>';
     }
+const dobText = (p.dob && p.dob.length) ? p.dob :
+  ((p.dob_year && p.dob_month && p.dob_day) ? `${String(p.dob_year).padStart(4,'0')}-${String(p.dob_month).padStart(2,'0')}-${String(p.dob_day).padStart(2,'0')}` : '');
 
-    tr.innerHTML = `
-      <td>${p.name}</td>
-      <td>${p.dob || ''}</td>
-      <td>${p.position || ''}</td>
-      <td>${p.franchise || ''}</td>
-      <td>${p.eligible ? '<span class="green">Yes</span>' : '<span class="danger">No</span>'}</td>
-    `;
+tr.innerHTML = `
+  <td>${p.mlbamid ?? ''}</td>
+  <td>${p.name || ''}</td>
+  <td>${p.first || ''}</td>
+  <td>${p.last || ''}</td>
+  <td>${p.bats || ''}</td>
+  <td>${p.throws || ''}</td>
+  <td>${p.position || ''}</td>
+  <td>${dobText}</td>
+  <td>${p.mlb_org || ''}</td>
+  <td>${p.franchise || ''}</td>
+`;
+
     tr.appendChild(actionCell);
     playersBody.appendChild(tr);
   }
@@ -781,7 +1132,6 @@ boot();
 def index():
     return render_template_string(INDEX_HTML)
 
-
 @app.get("/api/players")
 def api_players():
     search = (request.args.get("search") or "").strip().lower()
@@ -789,19 +1139,20 @@ def api_players():
 
     conn = get_conn()
     cur = conn.cursor()
-    q = "SELECT id, name, dob, position, franchise, eligible FROM players"
+    cols = ("id, name, dob, position, franchise, eligible, "
+            "mlbamid, first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org")
+    q = f"SELECT {cols} FROM players"
     params: List[Any] = []
 
     clauses = []
     if search:
-        clauses.append("LOWER(name) LIKE ?")
-        params.append(f"%{search}%")
+        clauses.append("(LOWER(name) LIKE ? OR LOWER(first) LIKE ? OR LOWER(last) LIKE ?)")
+        params += [f"%{search}%", f"%{search}%", f"%{search}%"]
     if hide_owned:
         clauses.append("(franchise IS NULL OR franchise = '')")
 
     if clauses:
         q += " WHERE " + " AND ".join(clauses)
-
     q += " ORDER BY name COLLATE NOCASE ASC"
 
     cur.execute(q, params)
@@ -811,14 +1162,25 @@ def api_players():
     players = []
     for r in rows:
         players.append({
-            "id": r[0],
-            "name": r[1],
-            "dob": r[2],
-            "position": r[3],
-            "franchise": r[4],
-            "eligible": int(r[5]),
+            "id": r["id"],
+            "name": r["name"],
+            "dob": r["dob"],
+            "position": r["position"],
+            "franchise": r["franchise"],
+            "eligible": int(r["eligible"] or 0),
+            "mlbamid": r["mlbamid"],
+            "first": r["first"],
+            "last": r["last"],
+            "bats": r["bats"],
+            "throws": r["throws"],
+            "dob_month": r["dob_month"],
+            "dob_day": r["dob_day"],
+            "dob_year": r["dob_year"],
+            "mlb_org": r["mlb_org"],
         })
     return jsonify({"players": players})
+
+
 
 
 @app.get("/api/draft_status")

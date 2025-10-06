@@ -107,6 +107,44 @@ def base_slot_for_index(i: int) -> datetime:
     start_day = (DRAFT_START + timedelta(days=day_idx)).date()
     return datetime(start_day.year, start_day.month, start_day.day, slot_hour, 0, 0, tzinfo=EASTERN)
 
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            dob TEXT,
+            position TEXT,
+            franchise TEXT,
+            eligible INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS draft_order (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round INTEGER NOT NULL,
+            pick INTEGER NOT NULL,
+            team TEXT NOT NULL,
+            player_id INTEGER,
+            drafted_at TEXT,
+            label TEXT,                         -- NEW: human display (e.g., 'C2.01')
+            UNIQUE(round, pick) ON CONFLICT IGNORE
+        )
+        """
+    )
+    # Ensure 'label' exists if table pre-existed
+    cur.execute("PRAGMA table_info(draft_order)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "label" not in cols:
+        cur.execute("ALTER TABLE draft_order ADD COLUMN label TEXT")
+    conn.commit()
+    conn.close()
+
+
 def end_of_day(dt: datetime) -> datetime:
     """Return the end-of-day miss slot at 7pm for the date of dt."""
     d = dt.date()
@@ -136,10 +174,10 @@ def compute_rows(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-      SELECT id, round, pick, team, player_id, drafted_at
+      SELECT id, round, pick, team, player_id, drafted_at, label
       FROM draft_order
       ORDER BY round ASC, pick ASC
-    """)
+    """)    
     picks = cur.fetchall()
 
     # Player names
@@ -253,7 +291,7 @@ def compute_rows(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
     # 5) Build rows
     rows: List[Dict[str, Any]] = []
     for i, rec in enumerate(picks):
-        pick_label = f"{rec['round']}.{rec['pick']}"
+        pick_label = rec["label"] or f"{rec['round']}.{rec['pick']}"
         if rec["player_id"]:
             player = player_name_by_id.get(rec["player_id"], f"Player #{rec['player_id']}")
             status = f"Selected at {rec['drafted_at'] or '—'}"
@@ -286,10 +324,10 @@ def _load_picks_and_overrides():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-      SELECT id, round, pick, team, player_id, drafted_at
+      SELECT id, round, pick, team, player_id, drafted_at, label
       FROM draft_order
       ORDER BY round ASC, pick ASC
-    """)
+    """)    
     picks = cur.fetchall()
 
     # overrides
@@ -424,10 +462,10 @@ def _load_picks_overrides_and_designated():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-      SELECT id, round, pick, team, player_id, drafted_at
+      SELECT id, round, pick, team, player_id, drafted_at, label
       FROM draft_order
       ORDER BY round ASC, pick ASC
-    """)
+    """)    
     picks = cur.fetchall()
 
     # load overrides

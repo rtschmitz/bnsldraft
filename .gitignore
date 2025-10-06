@@ -8,8 +8,6 @@ __pycache__/
 
 # Local data
 draft.db
-players.csv
-draft_order.csv
 
 # Environment / secrets
 .env
