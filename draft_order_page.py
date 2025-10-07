@@ -12,7 +12,6 @@ EASTERN = ZoneInfo("America/New_York")
 
 
 # ===== Time rules =====
-# Start: Nov 1, 2025 at 9:00 AM EST (fixed -05:00, no DST wiggles)
 DRAFT_START = datetime(2025, 11, 1, 9, 0, 0, tzinfo=EASTERN)
 
 # Draft window: 9am..6pm inclusive (10 normal picks/day), then the "end-of-day miss slot" at 7pm
@@ -126,15 +125,48 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+# --- Sunday helpers ---
+def is_sunday(d: datetime | date) -> bool:
+    return (d.weekday() == 6)  # Monday=0 … Sunday=6
+
+def next_non_sunday_date(d: date) -> date:
+    while d.weekday() == 6:
+        d = d + timedelta(days=1)
+    return d
+
+def bump_if_sunday(dt: datetime) -> datetime:
+    # If a scheduled time lands on Sunday, bump to Monday at the same clock time.
+    if dt.weekday() != 6:
+        return dt
+    nd = dt + timedelta(days=1)
+    while nd.weekday() == 6:
+        nd = nd + timedelta(days=1)
+    return nd
+
 def base_slot_for_index(i: int) -> datetime:
     """
-    Initial designated time for pick index i (0-based) ignoring misses.
-    9am..6pm hourly; after 6pm, next day 9am.
+    Initial designated time for pick index i (0-based), skipping Sundays entirely.
+    9am..6pm hourly; after 6pm, go to the next non-Sunday day at 9am.
     """
-    day_idx, offset_in_day = divmod(i, PICKS_PER_DAY)
+    # How many full (non-Sunday) days ahead?
+    full_days, offset_in_day = divmod(i, PICKS_PER_DAY)
+
+    # Walk forward `full_days` non-Sunday days from DRAFT_START.date()
+    day = DRAFT_START.date()
+    # Ensure the start itself isn’t Sunday
+    day = next_non_sunday_date(day)
+    advanced = 0
+    while advanced < full_days:
+        day = next_non_sunday_date(day + timedelta(days=1))
+        if day.weekday() != 6:  # skip Sundays
+            advanced += 1
+
+    # Ensure target day itself isn’t Sunday (paranoia)
+    day = next_non_sunday_date(day)
+
     slot_hour = DAY_FIRST_HOUR + offset_in_day
-    start_day = (DRAFT_START + timedelta(days=day_idx)).date()
-    return datetime(start_day.year, start_day.month, start_day.day, slot_hour, 0, 0, tzinfo=EASTERN)
+    return datetime(day.year, day.month, day.day, slot_hour, 0, 0, tzinfo=EASTERN)
+
 
 def init_db():
     conn = get_conn()
@@ -200,58 +232,19 @@ def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = No
     if now is None:
         now = datetime.now(tz=EASTERN)
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT id, round, pick, team, player_id, drafted_at, label
-      FROM draft_order
-      ORDER BY round ASC, pick ASC
-    """)    
-    picks = cur.fetchall()
-
-    # Player names
-    cur.execute("SELECT id, name FROM players")
-    player_name_by_id = {r["id"]: r["name"] for r in cur.fetchall()}
-
-    # --- manual overrides table (if present) ---
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pick_overrides (
-            draft_order_id INTEGER PRIMARY KEY,
-            scheduled_time TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    cur.execute("SELECT draft_order_id, scheduled_time FROM pick_overrides")
-    overrides_raw = cur.fetchall()
-    conn.close()
-
-    # Normalize overrides to Eastern
-    overrides: Dict[int, datetime] = {}
-    for r in overrides_raw:
-        try:
-            dt = datetime.fromisoformat(r["scheduled_time"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            overrides[r["draft_order_id"]] = dt.astimezone(EASTERN)
-        except Exception:
-            pass
-
+    # NEW: use unified loader
+    picks, designated = _load_picks_overrides_and_designated()
     total = len(picks)
 
-    # 1) Compute each pick's DESIGNATED time = override if present, else base slot.
-    designated: List[datetime] = []
-    for idx, rec in enumerate(picks):
-        bt = base_slot_for_index(idx)
-        designated.append(overrides.get(rec["id"], bt))
+    # still need player names
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM players")
+    player_name_by_id = {r["id"]: r["name"] for r in cur.fetchall()}
+    conn.close()
 
-    # 2) Next-deadline for pick i is the designated time of i+1 (very important!)
-    next_deadlines: List[datetime] = []
-    for i in range(total):
-        if i + 1 < total:
-            next_deadlines.append(designated[i + 1])
-        else:
-            # last pick: no "next pick" deadline
-            next_deadlines.append(designated[i] + timedelta(days=36500))
+    # NEW: single way to compute deadlines
+    next_deadlines = _next_deadlines_from_designated(designated)
 
     # 3) Classify undrafted picks: missed vs not-yet-missed (as of now)
     undrafted_idxs = [i for i, r in enumerate(picks) if not r["player_id"]]
@@ -259,30 +252,27 @@ def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = No
     scheduled_time: Dict[int, datetime] = {}
     overridden_idx: set[int] = set()
 
-    # If a pick itself has an override, that is its current designated time for display,
-    # but it still becomes 'missed' based on the NEXT pick's designated time.
-    for i in undrafted_idxs:
-        rec = picks[i]
-        if rec["id"] in overrides:
-            overridden_idx.add(i)
+    initially_missed: set[int] = set()
 
     for i in undrafted_idxs:
         if now >= next_deadlines[i]:
+            initially_missed.add(i)
             d = designated[i].astimezone(EASTERN).date()
             missed_by_day.setdefault((d.year, d.month, d.day), []).append(i)
         else:
-            # Not missed: show the pick's designated time (override or base)
             scheduled_time[i] = designated[i]
 
     # 4) Build evening queues day-by-day
     carryover_eod: List[int] = []  # re-missed evening picks → next day's evening
     # Start iterating from the earliest day that appears in the schedule (min of designated/base)
     earliest_day = (min(designated).astimezone(EASTERN)).date() if designated else DRAFT_START.date()
+    earliest_day = next_non_sunday_date(earliest_day)
     day = earliest_day
     safety_days = 0
 
     while len(scheduled_time) < len(undrafted_idxs) and safety_days < 3650:
         todays_misses = missed_by_day.get((day.year, day.month, day.day), [])
+        todays_misses.sort(key=lambda idx: designated[idx])
         evening_queue = todays_misses + carryover_eod
         new_carryover: List[int] = []
 
@@ -291,13 +281,13 @@ def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = No
             # but it can STILL re-miss if that override is before now+next slot. We keep it simple:
             # evening queue only applies to actually missed picks (we're already here),
             # so assign an evening slot unless it's re-missed immediately.
-            slot_dt = datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN)
+            slot_dt = bump_if_sunday(datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN))
 
             # The "next pick time" for this evening slot:
             if j + 1 < len(evening_queue):
                 next_deadline = datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j + 1, 0, 0, tzinfo=EASTERN)
             else:
-                nd = day + timedelta(days=1)
+                nd = next_non_sunday_date(day + timedelta(days=1))
                 next_deadline = datetime(nd.year, nd.month, nd.day, DAY_FIRST_HOUR, 0, 0, tzinfo=EASTERN)
 
             if now >= next_deadline:
@@ -307,14 +297,13 @@ def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = No
                 scheduled_time[idx] = slot_dt
 
         carryover_eod = new_carryover
-        day = day + timedelta(days=1)
+        day = next_non_sunday_date(day + timedelta(days=1))
         safety_days += 1
 
-    # Any leftovers: put on the next day 7pm onwards (extreme backstop)
     if carryover_eod:
+        nd = next_non_sunday_date(day)
         for j, idx in enumerate(carryover_eod):
-            nd = day
-            slot_dt = datetime(nd.year, nd.month, nd.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN)
+            slot_dt = bump_if_sunday(datetime(nd.year, nd.month, nd.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN))
             scheduled_time[idx] = slot_dt
 
     # 5) Build rows
@@ -334,10 +323,11 @@ def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = No
         else:
             t = scheduled_time.get(i, designated[i])  # always show designated/scheduled
             is_evening = t.astimezone(EASTERN).hour >= END_OF_DAY_MISS_HOUR
-            status_txt = "Missed → end of day" if is_evening and now >= designated[i] else "Scheduled"
-            # Mark manual debug overrides explicitly
-            if rec["id"] in overrides and t == overrides[rec["id"]]:
-                status_txt = "Overridden (debug)"
+            if i in initially_missed:
+                status_txt = "Missed → end of day"
+            else:
+                status_txt = "Scheduled"
+
             rows.append({
                 "pick_label": pick_label,
                 "team": rec["team"],
@@ -350,54 +340,6 @@ def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = No
 
     return rows
 
-def _load_picks_and_overrides():
-    """Internal: returns (picks_rows, designated_times, next_deadlines) using overrides when present."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-      SELECT id, round, pick, team, player_id, drafted_at, label
-      FROM draft_order
-      ORDER BY round ASC, pick ASC
-    """)    
-    picks = cur.fetchall()
-
-    # overrides
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS pick_overrides (
-            draft_order_id INTEGER PRIMARY KEY,
-            scheduled_time TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    cur.execute("SELECT draft_order_id, scheduled_time FROM pick_overrides")
-    overrides_raw = cur.fetchall()
-    conn.close()
-
-    overrides: Dict[int, datetime] = {}
-    for r in overrides_raw:
-        try:
-            dt = datetime.fromisoformat(r["scheduled_time"])
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            overrides[r["draft_order_id"]] = dt.astimezone(EASTERN)
-        except Exception:
-            pass
-
-    # designated = override if present else base slot
-    designated: List[datetime] = []
-    for idx, rec in enumerate(picks):
-        bt = base_slot_for_index(idx)
-        designated.append(overrides.get(rec["id"], bt))
-
-    # next deadline = next pick’s designated time (very important for misses)
-    next_deadlines: List[datetime] = []
-    for i in range(len(picks)):
-        if i + 1 < len(picks):
-            next_deadlines.append(designated[i + 1])
-        else:
-            next_deadlines.append(designated[i] + timedelta(days=36500))
-
-    return picks, designated, next_deadlines
 
 
 def get_current_on_clock_pick(now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
@@ -516,8 +458,12 @@ def _load_picks_overrides_and_designated():
         try:
             dt = datetime.fromisoformat(r["scheduled_time"])
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            overrides[r["draft_order_id"]] = dt.astimezone(EASTERN)
+                dt = dt.replace(tzinfo=EASTERN)
+            else:
+                dt = dt.astimezone(EASTERN)
+            dt = bump_if_sunday(dt)
+
+            overrides[r["draft_order_id"]] = dt
         except Exception:
             pass
 
@@ -527,6 +473,14 @@ def _load_picks_overrides_and_designated():
         designated.append(overrides.get(rec["id"], bt))
     return picks, designated
 
+def _next_deadlines_from_designated(designated: list[datetime]) -> list[datetime]:
+    nd = []
+    for i, t in enumerate(designated):
+        if i + 1 < len(designated):
+            nd.append(designated[i + 1])
+        else:
+            nd.append(t + timedelta(days=36500))
+    return nd
 
 def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
     """
@@ -539,14 +493,7 @@ def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
     """
     picks, designated = _load_picks_overrides_and_designated()
     total = len(picks)
-
-    # Next pick deadlines by designated time
-    next_deadlines: List[datetime] = []
-    for i in range(total):
-        if i + 1 < total:
-            next_deadlines.append(designated[i + 1])
-        else:
-            next_deadlines.append(designated[i] + timedelta(days=36500))
+    next_deadlines = _next_deadlines_from_designated(designated)
 
     undrafted_idxs = [i for i, r in enumerate(picks) if not r["player_id"]]
 
@@ -554,33 +501,35 @@ def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
     missed_by_day: Dict[tuple[int,int,int], List[int]] = {}
     scheduled_time: Dict[int, datetime] = {}
 
+    initially_missed: set[int] = set()
+
     for i in undrafted_idxs:
         if now >= next_deadlines[i]:
+            initially_missed.add(i)
             d = designated[i].astimezone(EASTERN).date()
             missed_by_day.setdefault((d.year, d.month, d.day), []).append(i)
         else:
             scheduled_time[i] = designated[i]
 
     # Evening queues day-by-day, with carryover for re-misses
-    if designated:
-        day = (min(designated).astimezone(EASTERN)).date()
-    else:
-        day = DRAFT_START.date()
+    day = next_non_sunday_date(now.date())
+
 
     carryover_eod: List[int] = []
     safety_days = 0
     while len(scheduled_time) < len(undrafted_idxs) and safety_days < 3650:
         todays_misses = missed_by_day.get((day.year, day.month, day.day), [])
+        todays_misses.sort(key=lambda idx: designated[idx])   # NEW
         evening_queue = todays_misses + carryover_eod
         new_carryover: List[int] = []
 
         for j, idx in enumerate(evening_queue):
-            slot_dt = datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN)
+            slot_dt = bump_if_sunday(datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN))
             # Next pick time for this evening slot:
             if j + 1 < len(evening_queue):
                 next_deadline = datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j + 1, 0, 0, tzinfo=EASTERN)
             else:
-                nd = day + timedelta(days=1)
+                nd = next_non_sunday_date(day + timedelta(days=1))
                 next_deadline = datetime(nd.year, nd.month, nd.day, DAY_FIRST_HOUR, 0, 0, tzinfo=EASTERN)
 
             if now >= next_deadline:
@@ -589,14 +538,15 @@ def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
                 scheduled_time[idx] = slot_dt
 
         carryover_eod = new_carryover
-        day = day + timedelta(days=1)
+        day = next_non_sunday_date(day + timedelta(days=1))
         safety_days += 1
-
-    # Any leftovers (extreme): shove onto the next day starting 7pm onward
+    # Any leftovers: put on the next day 7pm onwards (extreme backstop)
     if carryover_eod:
+        nd = next_non_sunday_date(day)
         for j, idx in enumerate(carryover_eod):
-            nd = day
-            scheduled_time[idx] = datetime(nd.year, nd.month, nd.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN)
+            scheduled_time[idx] = bump_if_sunday(
+                datetime(nd.year, nd.month, nd.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN)
+            )
 
     return scheduled_time
 
