@@ -94,13 +94,51 @@ MLB_TEAMS = [
 ]
 
 # Map all teams to four test emails (round-robin) so you can exercise the system easily.
-_TEST_EMAILS = [
-    "ryanschmitz43@yahoo.com",
-    "ryanschmitz43@gmail.com",
-    "schmitz@ucsb.edu",
-    "condor2199@yahoo.com",
-]
-TEAM_EMAILS = {team: _TEST_EMAILS[i % len(_TEST_EMAILS)] for i, team in enumerate(MLB_TEAMS)}
+#_TEST_EMAILS = [
+#    "ryanschmitz43@yahoo.com",
+#    "ryanschmitz43@gmail.com",
+#    "schmitz@ucsb.edu",
+#    "condor2199@yahoo.com",
+#]
+#TEAM_EMAILS = {team: _TEST_EMAILS[i % len(_TEST_EMAILS)] for i, team in enumerate(MLB_TEAMS)}
+
+TEAM_EMAILS = {
+    "Toronto Blue Jays": "daniele.defeo@gmail.com",
+    "New York Yankees": "dmsund66@gmail.com",
+    "Boston Red Sox": "chris_lawrence@sbcglobal.net",
+    "Tampa Bay Rays": "smith.mark.louis@gmail.com",
+    "Baltimore Orioles": "bsweis@ptd.net",
+
+    "Detroit Tigers": "manconley@gmail.com",
+    "Kansas City Royals": "jim@timhafer.com",
+    "Minnesota Twins": "jonathan.adelman@gmail.com",
+    "Chicago White Sox": "bglover6@gmail.com",
+    "Cleveland Guardians": "bonfanti20@gmail.com",
+
+    "Los Angeles Angels": "dsucoff@gmail.com",
+    "Seattle Mariners": "daniel_a_fisher@yahoo.com",
+    "Oakland Athletics": "bspropp@hotmail.com",
+    "Houston Astros": "golk624@protonmail.com",
+    "Texas Rangers": "Brianorr@live.com",
+
+    "Washington Nationals": "smsetnor@gmail.com",
+    "New York Mets": "kerkhoffc@gmail.com",
+    "Philadelphia Phillies": "jdcarney26@gmail.com",
+    "Atlanta Braves": "stevegaston@yahoo.com",
+    "Miami Marlins": "schmitz@ucsb.edu",
+
+    "St. Louis Cardinals": "parkbench@mac.com",
+    "Chicago Cubs": "bryanhartman@gmail.com",
+    "Pittsburgh Pirates": "jseiner24@gmail.com",
+    "Milwaukee Brewers": "tsurratt@hiaspire.com",
+    "Cincinnati Reds": "jpmile@yahoo.com",
+
+    "Los Angeles Dodgers": "jr92@comcast.net",
+    "Colorado Rockies": "GypsySon@gmail.com",
+    "Arizona Diamondbacks": "mhr4240@gmail.com",
+    "San Francisco Giants": "jasonmallet@gmail.com",
+    "San Diego Padres": "mattaca77@gmail.com",
+}
 
 
 # -------------------------
