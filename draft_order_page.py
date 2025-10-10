@@ -12,7 +12,7 @@ EASTERN = ZoneInfo("America/New_York")
 
 
 # ===== Time rules =====
-DRAFT_START = datetime(2025, 11, 1, 9, 0, 0, tzinfo=EASTERN)
+DRAFT_START = datetime(2025, 10, 20, 9, 0, 0, tzinfo=EASTERN)
 
 # Draft window: 9am..6pm inclusive (10 normal picks/day), then the "end-of-day miss slot" at 7pm
 DAY_FIRST_HOUR = 9

@@ -56,7 +56,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List
 from draft_order_page import order_bp
-
+import unicodedata
 from flask import (
     Flask, request, jsonify, session, redirect, url_for, render_template_string, abort
 )
@@ -389,11 +389,20 @@ def send_email(to_addr: str, subject: str, body: str):
             s.login(user, pw)
         s.send_message(msg)
 
-
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+
+    # Register unaccent(text) for accent-insensitive search/sort
+    def _unaccent(s):
+        if s is None:
+            return ""
+        # NFKD -> strip combining marks
+        return "".join(ch for ch in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(ch))
+    conn.create_function("unaccent", 1, _unaccent)
+
     return conn
+
 
 def emails_equal(a: str | None, b: str | None) -> bool:
     if not a or not b:
@@ -520,8 +529,15 @@ def init_db():
     if "dob_day" not in cols:     add_cols.append(("dob_day", "INTEGER"))
     if "dob_year" not in cols:    add_cols.append(("dob_year", "INTEGER"))
     if "mlb_org" not in cols:     add_cols.append(("mlb_org", "TEXT"))
+
     for col, typ in add_cols:
         cur.execute(f"ALTER TABLE players ADD COLUMN {col} {typ}")
+    # — Add-on columns for draft grades —
+    cur.execute("PRAGMA table_info(players)")
+    pcols2 = {row[1] for row in cur.fetchall()}
+    for col in ("fg_30","fg_fv","mlb_30","mlb_fv","fg100","mlb100"):
+        if col not in pcols2:
+            cur.execute(f"ALTER TABLE players ADD COLUMN {col} INTEGER")
     conn.commit()
     conn.close()
 
@@ -765,8 +781,6 @@ def import_players_from_playerlist(path: Path):
                SET name      = ?,
                    dob       = ?,
                    position  = ?,
-                   first     = ?,
-                   last      = ?,
                    bats      = ?,
                    throws    = ?,
                    dob_month = ?,
@@ -774,15 +788,21 @@ def import_players_from_playerlist(path: Path):
                    dob_year  = ?,
                    mlb_org   = ?,
                    franchise = COALESCE(NULLIF(?, ''), franchise),
-                   eligible  = ?
+                   eligible  = ?,
+                   fg_30     = ?,
+                   fg_fv     = ?,
+                   mlb_30    = ?,
+                   mlb_fv    = ?,
+                   fg100     = ?,
+                   mlb100    = ?
              WHERE id = ?
         """, (
             values["name"], values["dob"], values["position"],
-            values["first"], values["last"], values["bats"], values["throws"],
+            values["bats"], values["throws"],
             values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"],
-            # Only set franchise if incoming has a non-empty value (we pass ''), else keep existing:
-            "",  # incoming franchise is always "" during import; do not clobber existing
-            keep_eligible,  # preserve eligible
+            "",                    # don't clobber franchise during import
+            keep_eligible,         # preserve eligible flag
+            values["fg_30"], values["fg_fv"], values["mlb_30"], values["mlb_fv"], values["fg100"], values["mlb100"],
             existing_row["id"],
         ))
 
@@ -791,8 +811,6 @@ def import_players_from_playerlist(path: Path):
         for row in r:
             mlbamid = int(row.get("MLBAMID") or 0)
             name    = (row.get("Name") or "").strip()
-            first   = (row.get("First") or "").strip()
-            last    = (row.get("Last") or "").strip()
             bats    = (row.get("Bats") or "").strip()
             throws  = (row.get("Throws") or "").strip()
             pos     = (row.get("Position") or "").strip()
@@ -800,6 +818,19 @@ def import_players_from_playerlist(path: Path):
             dob_d   = int(row.get("DOB_Day") or 0)
             dob_y   = int(row.get("DOB_Year") or 0)
             org     = (row.get("MLB org.") or "").strip()
+            fg_30  = row.get("FG_30")   or row.get("FG30")   or ""
+            fg_fv  = row.get("FG_FV")   or row.get("FGFV")   or ""
+            mlb_30 = row.get("MLB_30")  or row.get("MLB30")  or ""
+            mlb_fv = row.get("MLB_FV")  or row.get("MLBFV")  or ""
+            fg100  = row.get("FG100")   or ""
+            mlb100 = row.get("MLB100")  or ""
+
+            def _int_or_none(x):
+                try:
+                    x = str(x).strip()
+                    return int(x) if x != "" else None
+                except Exception:
+                    return None
 
             dob = ""
             if dob_y and dob_m and dob_d:
@@ -810,8 +841,6 @@ def import_players_from_playerlist(path: Path):
                 "name": name,
                 "dob": dob or None,
                 "position": pos,
-                "first": first,
-                "last": last,
                 "bats": bats,
                 "throws": throws,
                 "dob_month": dob_m or None,
@@ -819,6 +848,14 @@ def import_players_from_playerlist(path: Path):
                 "dob_year": dob_y or None,
                 "mlb_org": org,
             }
+            values.update({
+               "fg_30":  _int_or_none(fg_30),
+               "fg_fv":  _int_or_none(fg_fv),
+               "mlb_30": _int_or_none(mlb_30),
+               "mlb_fv": _int_or_none(mlb_fv),
+               "fg100":  _int_or_none(fg100),
+               "mlb100": _int_or_none(mlb100),
+            })
 
             if mlbamid > 0:
                 # Upsert on mlbamid
@@ -830,11 +867,11 @@ def import_players_from_playerlist(path: Path):
                     cur.execute("""
                         INSERT INTO players
                           (mlbamid, name, dob, position, franchise, eligible,
-                           first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           bats, throws, dob_month, dob_day, dob_year, mlb_org, fg_30, fg_fv, mlb_30, mlb_fv, fg100, mlb100)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (values["mlbamid"], values["name"], values["dob"], values["position"],
-                          "", 1, values["first"], values["last"], values["bats"], values["throws"],
-                          values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"]))
+                          "", 1, values["bats"], values["throws"],
+                          values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"],values["fg_30"], values["fg_fv"], values["mlb_30"], values["mlb_fv"], values["fg100"], values["mlb100"]))
             else:
                 # Upsert on (name, dob) when no mlbamid
                 cur.execute("""
@@ -850,11 +887,11 @@ def import_players_from_playerlist(path: Path):
                     cur.execute("""
                         INSERT INTO players
                           (mlbamid, name, dob, position, franchise, eligible,
-                           first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           bats, throws, dob_month, dob_day, dob_year, mlb_org, fg_30, fg_fv, mlb_30, mlb_fv, fg100, mlb100)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (None, values["name"], values["dob"], values["position"],
-                          "", 1, values["first"], values["last"], values["bats"], values["throws"],
-                          values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"]))
+                          "", 1, values["bats"], values["throws"],
+                          values["dob_month"], values["dob_day"], values["dob_year"], values["mlb_org"],values["fg_30"], values["fg_fv"], values["mlb_30"], values["mlb_fv"], values["fg100"], values["mlb100"]))
 
     conn.commit()
     conn.close()
@@ -1364,6 +1401,8 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>League Draft</title>
   <style>
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable .sort-ind { opacity: 0.6; margin-left: 4px; font-size: 12px; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
     .topbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
     .pill { padding: 6px 10px; border-radius: 999px; background: #f2f2f2; display: inline-flex; gap: 8px; align-items: center; }
@@ -1422,25 +1461,30 @@ INDEX_HTML = r"""
   <table>
 <thead>
   <tr>
-    <th style="width:8%;">MLBAMID</th>
-    <th style="width:16%;">Name</th>
-    <th style="width:10%;">First</th>
-    <th style="width:10%;">Last</th>
-    <th style="width:6%;">Bats</th>
-    <th style="width:6%;">Throws</th>
-    <th style="width:8%;">Pos</th>
-    <th style="width:12%;">DOB</th>
-    <th style="width:14%;">MLB Org</th>
-    <th style="width:10%;">Owned By</th>
-    <th style="width:10%;">Action</th>
+    <th class="sortable" data-col="mlbamid"   style="width:7%;">MLBAMID</th>
+    <th class="sortable" data-col="name"      style="width:18%;">Name</th>
+    <th class="sortable" data-col="bats"      style="width:6%;">Bats</th>
+    <th class="sortable" data-col="throws"    style="width:6%;">Throws</th>
+    <th class="sortable" data-col="position"  style="width:7%;">Pos</th>
+    <th class="sortable" data-col="dob"       style="width:12%;">DOB</th>
+    <th class="sortable" data-col="mlb_org"   style="width:14%;">MLB Org</th>
+    <th class="sortable" data-col="fg_30"     style="width:6%;">FG 30</th>
+    <th class="sortable" data-col="fg_fv"     style="width:6%;">FG FV</th>
+    <th class="sortable" data-col="mlb_30"    style="width:6%;">MLB 30</th>
+    <th class="sortable" data-col="mlb_fv"    style="width:6%;">MLB FV</th>
+    <th class="sortable" data-col="fg100"     style="width:6%;">FG100</th>
+    <th class="sortable" data-col="mlb100"    style="width:6%;">MLB100</th>
+    <th class=""           style="width:9%;">Action</th>
   </tr>
 </thead>
-    <tbody id="players-body"></tbody>
+
+<tbody id="players-body"></tbody>
   </table>
 
 
 
 <script>
+const tableHead = document.querySelector('thead');
 const playersBody = document.getElementById('players-body');
 const searchInput = document.getElementById('search');
 const hideOwned = document.getElementById('hide-owned');
@@ -1456,9 +1500,42 @@ let state = {
   hideOwned: false,
   myTeam: null,
   currentPick: null,
-  authedForSelected: false,  // ← add here
-  authedEmail: ''            // ← and here
+  authedForSelected: false,
+  authedEmail: '',
+  sort: { key: null, dir: 'asc' }
 };
+
+function setHeaderIndicators() {
+  // remove old indicators
+  document.querySelectorAll('th.sortable').forEach(th => {
+    const span = th.querySelector('.sort-ind');
+    if (span) span.remove();
+  });
+  // add for active
+  if (!state.sort.key) return;
+  const th = document.querySelector(`th.sortable[data-col="${state.sort.key}"]`);
+  if (!th) return;
+  const mark = document.createElement('span');
+  mark.className = 'sort-ind';
+  mark.textContent = state.sort.dir === 'asc' ? '▲' : '▼';
+  th.appendChild(mark);
+}
+
+tableHead.addEventListener('click', (e) => {
+  const th = e.target.closest('th.sortable');
+  if (!th) return;
+  const key = th.getAttribute('data-col');
+  if (state.sort.key === key) {
+    state.sort.dir = (state.sort.dir === 'asc') ? 'desc' : 'asc';
+  } else {
+    state.sort.key = key;
+    state.sort.dir = 'asc';
+  }
+  // re-fetch (keeps results current) then render with sorting
+  fetchPlayers();
+  setHeaderIndicators();
+});
+
 
 
 function focusSearchSlashShortcut(e){
@@ -1530,13 +1607,112 @@ async function fetchPlayers() {
   renderPlayers(data.players);
 }
 
+
+function normalizeStr(x) { return (x ?? '').toString().toLowerCase(); }
+function asNumber(x) {
+  if (x === null || x === undefined) return null;
+
+  if (typeof x === 'string') {
+    const s = x.trim();
+    if (s === '') return null;                  // ← key change: empty string stays empty
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  if (typeof x === 'number') {
+    return Number.isFinite(x) ? x : null;
+  }
+
+  return null;
+}
+
+
+function asDate(x) { // expects YYYY-MM-DD or empty
+  if (!x) return null;
+  const t = Date.parse(x);
+  return Number.isFinite(t) ? t : null;
+}
+
+const SORTERS = {
+  mlbamid:  (p) => asNumber(p.mlbamid),
+  name:     (p) => normalizeStr(p.name),
+  bats:     (p) => normalizeStr(p.bats),
+  throws:   (p) => normalizeStr(p.throws),
+  position: (p) => normalizeStr(p.position),
+  dob:      (p) => asDate(p.dob) ?? asDate(
+              (p.dob_year && p.dob_month && p.dob_day)
+                ? `${String(p.dob_year).padStart(4,'0')}-${String(p.dob_month).padStart(2,'0')}-${String(p.dob_day).padStart(2,'0')}`
+                : ''
+            ),
+  mlb_org:  (p) => normalizeStr(p.mlb_org),
+  franchise:(p) => normalizeStr(p.franchise),
+  fg_30:    (p) => asNumber(p.fg_30),
+  fg_fv:    (p) => asNumber(p.fg_fv),
+  mlb_30:   (p) => asNumber(p.mlb_30),
+  mlb_fv:   (p) => asNumber(p.mlb_fv),
+  fg100:    (p) => asNumber(p.fg100),
+  mlb100:   (p) => asNumber(p.mlb100),
+};
+
+
+function isEmptyVal(v) {
+  // treat null/undefined/''/whitespace/NaN as empty
+  return (
+    v === null ||
+    v === undefined ||
+    (typeof v === 'number' && !Number.isFinite(v)) ||
+    (typeof v === 'string' && v.trim() === '')
+  );
+}
+
+function applySort(arr) {
+  const key = state.sort.key;
+  if (!key || !SORTERS[key]) return arr;
+
+  const dir = state.sort.dir === 'desc' ? -1 : 1;
+  const getter = SORTERS[key];
+
+  return [...arr].sort((p1, p2) => {
+    const a = getter(p1);
+    const b = getter(p2);
+
+    const aEmpty = isEmptyVal(a);
+    const bEmpty = isEmptyVal(b);
+
+    // Always push empties to the bottom (for both asc & desc)
+    if (aEmpty && !bEmpty) return 1;
+    if (!aEmpty && bEmpty) return -1;
+    if (aEmpty && bEmpty)  return 0; // keep relative order of blanks
+
+    // Both non-empty → compare properly
+    if (typeof a === 'number' && typeof b === 'number') {
+      const cmp = a - b;
+      return dir * (cmp === 0 ? 0 : (cmp < 0 ? -1 : 1));
+    }
+
+    // Strings / mixed: case-insensitive, numeric-aware
+    const cmp = String(a).localeCompare(String(b), undefined, {
+      numeric: true,
+      sensitivity: 'base'
+    });
+    return dir * (cmp === 0 ? 0 : (cmp < 0 ? -1 : 1));
+  });
+}
+
+
+
 function renderPlayers(players) {
   playersBody.innerHTML = '';
+  players = applySort(players);
+
   const canDraftNow = state.currentPick 
     && state.myTeam 
     && state.currentPick.team === state.myTeam
     && state.authedForSelected; // must be logged in for that team
-  
+
+
+
+
   for (const p of players) {
     const tr = document.createElement('tr');
     tr.className = 'row-hover' + (p.franchise ? ' owned' : '');
@@ -1608,20 +1784,28 @@ function renderPlayers(players) {
     }
 
 const dobText = (p.dob && p.dob.length) ? p.dob :
-  ((p.dob_year && p.dob_month && p.dob_day) ? `${String(p.dob_year).padStart(4,'0')}-${String(p.dob_month).padStart(2,'0')}-${String(p.dob_day).padStart(2,'0')}` : '');
+  ((p.dob_year && p.dob_month && p.dob_day)
+    ? `${String(p.dob_year).padStart(4,'0')}-${String(p.dob_month).padStart(2,'0')}-${String(p.dob_day).padStart(2,'0')}`
+    : '');
+
+function show(x){ return (x === null || x === undefined) ? '' : x; }
 
 tr.innerHTML = `
   <td>${p.mlbamid ?? ''}</td>
   <td>${p.name || ''}</td>
-  <td>${p.first || ''}</td>
-  <td>${p.last || ''}</td>
   <td>${p.bats || ''}</td>
   <td>${p.throws || ''}</td>
   <td>${p.position || ''}</td>
   <td>${dobText}</td>
   <td>${p.mlb_org || ''}</td>
-  <td>${p.franchise || ''}</td>
+  <td>${show(p.fg_30)}</td>
+  <td>${show(p.fg_fv)}</td>
+  <td>${show(p.mlb_30)}</td>
+  <td>${show(p.mlb_fv)}</td>
+  <td>${show(p.fg100)}</td>
+  <td>${show(p.mlb100)}</td>
 `;
+
 
     tr.appendChild(actionCell);
     playersBody.appendChild(tr);
@@ -1676,10 +1860,11 @@ loginBtn.addEventListener('click', async () => {
 
 async function boot() {
   await fetchDraftStatus().catch(() => {});
-  updateLoginButtonState();  // NEW
+  updateLoginButtonState();
   await fetchPlayers().catch((e) => console.error('fetchPlayers failed:', e));
-
+  setHeaderIndicators();
 }
+
 
 
 boot();
@@ -1792,20 +1977,25 @@ def api_players():
         in_queue = {int(r[0]) for r in cur.fetchall()}
 
     cols = ("id, name, dob, position, franchise, eligible, "
-            "mlbamid, first, last, bats, throws, dob_month, dob_day, dob_year, mlb_org")
+        "mlbamid, bats, throws, dob_month, dob_day, dob_year, mlb_org, "
+        "fg_30, fg_fv, mlb_30, mlb_fv, fg100, mlb100")
+
     q = f"SELECT {cols} FROM players"
     params: List[Any] = []
 
     clauses = []
     if search:
-        clauses.append("(LOWER(name) LIKE ? OR LOWER(first) LIKE ? OR LOWER(last) LIKE ?)")
-        params += [f"%{search}%", f"%{search}%", f"%{search}%"]
+        # accent-insensitive search across name/first/last
+        clauses.append("(LOWER(unaccent(name)) LIKE ? OR LOWER(unaccent(first)) LIKE ? OR LOWER(unaccent(last)) LIKE ?)")
+        s = "".join(ch for ch in unicodedata.normalize("NFKD", search) if not unicodedata.combining(ch))
+        params += [f"%{s.lower()}%", f"%{s.lower()}%", f"%{s.lower()}%"]
+
     if hide_owned:
         clauses.append("(franchise IS NULL OR franchise = '')")
 
     if clauses:
         q += " WHERE " + " AND ".join(clauses)
-    q += " ORDER BY name COLLATE NOCASE ASC"
+    q += " ORDER BY unaccent(name) COLLATE NOCASE ASC"
 
     cur.execute(q, params)
     rows = cur.fetchall()
@@ -1821,14 +2011,18 @@ def api_players():
             "franchise": r["franchise"],
             "eligible": int(r["eligible"] or 0),
             "mlbamid": r["mlbamid"],
-            "first": r["first"],
-            "last": r["last"],
             "bats": r["bats"],
             "throws": r["throws"],
             "dob_month": r["dob_month"],
             "dob_day": r["dob_day"],
             "dob_year": r["dob_year"],
             "mlb_org": r["mlb_org"],
+            "fg_30":  r["fg_30"],
+            "fg_fv":  r["fg_fv"],
+            "mlb_30": r["mlb_30"],
+            "mlb_fv": r["mlb_fv"],
+            "fg100":  r["fg100"],
+            "mlb100": r["mlb100"],
             "in_queue": (r["id"] in in_queue),
         })
     return jsonify({"players": players})
