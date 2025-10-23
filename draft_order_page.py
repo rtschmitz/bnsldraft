@@ -218,125 +218,59 @@ def end_of_next_day(dt: datetime) -> datetime:
 def fmt_est(dt: datetime) -> str:
     return dt.strftime("%a %b %-d, %Y • %-I:%M %p ET")
 
-def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = None) -> List[Dict[str, Any]]:    
+def compute_rows(now: Optional[datetime] = None, team_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    DST-aware Eastern schedule with miss rollups:
-      • Base schedule: hourly 9:00–18:00 local (10 slots/day).
-      • A pick is 'missed' if not selected by the *following pick's designated time*.
-        (Designated time = override if present, else base slot.)
-      • Same-day misses queue at 19:00, 20:00, 21:00, … in miss order.
-      • If an evening slot is also missed (no selection by its *next* pick time),
-        it moves to the END of the NEXT day’s evening queue, after that day’s same-day misses.
-      • Draft order never changes.
+    Show rows using the SAME scheduler used by enforcement:
+      • Time displayed = _compute_scheduled_times(now)
+      • 'Missed → end of day' label still based on DESIGNATED deadlines
     """
     if now is None:
         now = datetime.now(tz=EASTERN)
 
-    # NEW: use unified loader
+    # Load picks & designated (override-or-base)
     picks, designated = _load_picks_overrides_and_designated()
-    total = len(picks)
 
-    # still need player names
+    # Name lookup for drafted rows
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT id, name FROM players")
     player_name_by_id = {r["id"]: r["name"] for r in cur.fetchall()}
     conn.close()
 
-    # NEW: single way to compute deadlines
+    # Use the SAME scheduler the app uses elsewhere
+    scheduled = _compute_scheduled_times(now)
+
+    # For the “missed” label, use the order-page rule (deadline = next DESIGNATED time)
     next_deadlines = _next_deadlines_from_designated(designated)
 
-    # 3) Classify undrafted picks: missed vs not-yet-missed (as of now)
-    undrafted_idxs = [i for i, r in enumerate(picks) if not r["player_id"]]
-    missed_by_day: Dict[tuple[int,int,int], List[int]] = {}  # key by (Y,M,D) to avoid tz drift
-    scheduled_time: Dict[int, datetime] = {}
-    overridden_idx: set[int] = set()
-
-    initially_missed: set[int] = set()
-
-    for i in undrafted_idxs:
-        if now >= next_deadlines[i]:
-            initially_missed.add(i)
-            d = designated[i].astimezone(EASTERN).date()
-            missed_by_day.setdefault((d.year, d.month, d.day), []).append(i)
-        else:
-            scheduled_time[i] = designated[i]
-
-    # 4) Build evening queues day-by-day
-    carryover_eod: List[int] = []  # re-missed evening picks → next day's evening
-    # Start iterating from the earliest day that appears in the schedule (min of designated/base)
-    earliest_day = (min(designated).astimezone(EASTERN)).date() if designated else DRAFT_START.date()
-    earliest_day = next_non_sunday_date(earliest_day)
-    day = earliest_day
-    safety_days = 0
-
-    while len(scheduled_time) < len(undrafted_idxs) and safety_days < 3650:
-        todays_misses = missed_by_day.get((day.year, day.month, day.day), [])
-        todays_misses.sort(key=lambda idx: designated[idx])
-        evening_queue = todays_misses + carryover_eod
-        new_carryover: List[int] = []
-
-        for j, idx in enumerate(evening_queue):
-            # If the pick has a manual override in the future, keep its designated override for display
-            # but it can STILL re-miss if that override is before now+next slot. We keep it simple:
-            # evening queue only applies to actually missed picks (we're already here),
-            # so assign an evening slot unless it's re-missed immediately.
-            slot_dt = bump_if_sunday(datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN))
-
-            # The "next pick time" for this evening slot:
-            if j + 1 < len(evening_queue):
-                next_deadline = datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j + 1, 0, 0, tzinfo=EASTERN)
-            else:
-                nd = next_non_sunday_date(day + timedelta(days=1))
-                next_deadline = datetime(nd.year, nd.month, nd.day, DAY_FIRST_HOUR, 0, 0, tzinfo=EASTERN)
-
-            if now >= next_deadline:
-                # Re-missed → push to next day evening tail
-                new_carryover.append(idx)
-            else:
-                scheduled_time[idx] = slot_dt
-
-        carryover_eod = new_carryover
-        day = next_non_sunday_date(day + timedelta(days=1))
-        safety_days += 1
-
-    if carryover_eod:
-        nd = next_non_sunday_date(day)
-        for j, idx in enumerate(carryover_eod):
-            slot_dt = bump_if_sunday(datetime(nd.year, nd.month, nd.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN))
-            scheduled_time[idx] = slot_dt
-
-    # 5) Build rows
     rows: List[Dict[str, Any]] = []
     for i, rec in enumerate(picks):
         pick_label = rec["label"] or f"{rec['round']}.{rec['pick']}"
         if rec["player_id"]:
-            player = player_name_by_id.get(rec["player_id"], f"Player #{rec['player_id']}")
-            status = f"Selected at {rec['drafted_at'] or '—'}"
             rows.append({
                 "pick_label": pick_label,
                 "team": rec["team"],
-                "player": player,
+                "player": player_name_by_id.get(rec["player_id"], f"Player #{rec['player_id']}"),
                 "time_display": "",
-                "status": status,
+                "status": f"Selected at {rec['drafted_at'] or '—'}",
             })
-        else:
-            t = scheduled_time.get(i, designated[i])  # always show designated/scheduled
-            is_evening = t.astimezone(EASTERN).hour >= END_OF_DAY_MISS_HOUR
-            if i in initially_missed:
-                status_txt = "Missed → end of day"
-            else:
-                status_txt = "Scheduled"
+            continue
 
-            rows.append({
-                "pick_label": pick_label,
-                "team": rec["team"],
-                "player": None,
-                "time_display": fmt_est(t),
-                "status": status_txt,
-            })
+        # Always display the unified scheduled time (this rolls evening re-misses to tomorrow)
+        t = scheduled.get(i, designated[i])
+        # Status string for context (unchanged logic)
+        status_txt = "Missed → end of day" if (now >= next_deadlines[i]) else "Scheduled"
+
+        rows.append({
+            "pick_label": pick_label,
+            "team": rec["team"],
+            "player": None,
+            "time_display": fmt_est(t),
+            "status": status_txt,
+        })
+
     if team_filter:
-        rows = [r for r in rows if r.get("team") == team_filter]
+        rows = [r for r in rows if r["team"] == team_filter]
 
     return rows
 
@@ -490,66 +424,78 @@ def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
           same day 7pm, 8pm, ... in miss order.
       - If an evening slot is also missed, cascade to the *next day's* evening tail.
       - Always return a time that is >= now or the next valid slot in the future.
+
+    NOTE: If an evening slot was yesterday (or earlier), and 'now' is already a later date,
+          we treat it as re-missed immediately and roll it to today's evening tail (no need to
+          wait until 9:00 AM). This fixes the "DET sticks at yesterday 7pm after NYY drafted" case.
     """
     picks, designated = _load_picks_overrides_and_designated()
-    total = len(picks)
     next_deadlines = _next_deadlines_from_designated(designated)
 
     undrafted_idxs = [i for i, r in enumerate(picks) if not r["player_id"]]
 
-    # Classify initial misses by the *day of the pick's designated time*
-    missed_by_day: Dict[tuple[int,int,int], List[int]] = {}
+    # Initial classification: which picks are already 'missed' by their next designated deadline
+    missed_by_day: Dict[tuple[int, int, int], List[int]] = {}
     scheduled_time: Dict[int, datetime] = {}
-
-    initially_missed: set[int] = set()
 
     for i in undrafted_idxs:
         if now >= next_deadlines[i]:
-            initially_missed.add(i)
             d = designated[i].astimezone(EASTERN).date()
             missed_by_day.setdefault((d.year, d.month, d.day), []).append(i)
         else:
             scheduled_time[i] = designated[i]
 
-    # Evening queues day-by-day, with carryover for re-misses
-    # IMPORTANT: start from the earliest designated day (same as compute_rows),
-    # not "today", so we actually process yesterday's (or earlier) misses.
-    if designated:
+    # Choose the first day to process: earliest day with misses, else earliest designated day, else start date
+    if missed_by_day:
+        y, m, d = sorted(missed_by_day.keys())[0]
+        earliest_day = next_non_sunday_date(datetime(y, m, d, tzinfo=EASTERN).date())
+    elif designated:
         earliest_day = next_non_sunday_date(min(designated).astimezone(EASTERN).date())
     else:
         earliest_day = next_non_sunday_date(DRAFT_START.date())
+
     day = earliest_day
-
-
-
     carryover_eod: List[int] = []
-    safety_days = 0
-    while len(scheduled_time) < len(undrafted_idxs) and safety_days < 3650:
-        todays_misses = missed_by_day.get((day.year, day.month, day.day), [])
-        # Ensure stable ordering within the day by original designated time
-        todays_misses.sort(key=lambda idx: designated[idx])
 
-        evening_queue = todays_misses + carryover_eod
+    # Local "today" used for previous-day re-miss detection
+    now_local_date = now.astimezone(EASTERN).date()
+
+    safety_days = 0
+    total_needed = len(undrafted_idxs)
+    while len(scheduled_time) < total_needed and safety_days < 3650:
+        todays_misses = missed_by_day.get((day.year, day.month, day.day), [])
+        todays_misses.sort(key=lambda idx: designated[idx])  # stable within-day by original designated time
+
+        # Keep previously scheduled carryovers first (keep 7pm/8pm stable), append same-day misses after them.
+        evening_queue = carryover_eod + todays_misses
         new_carryover: List[int] = []
 
         for j, idx in enumerate(evening_queue):
-            slot_dt = bump_if_sunday(datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN))
-            # Next pick time for this evening slot:
-            if j + 1 < len(evening_queue):
-                next_deadline = datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j + 1, 0, 0, tzinfo=EASTERN)
-            else:
-                nd = next_non_sunday_date(day + timedelta(days=1))
-                next_deadline = datetime(nd.year, nd.month, nd.day, DAY_FIRST_HOUR, 0, 0, tzinfo=EASTERN)
+            # Proposed evening slot for this item on 'day'
+            slot_dt = bump_if_sunday(
+                datetime(day.year, day.month, day.day, END_OF_DAY_MISS_HOUR + j, 0, 0, tzinfo=EASTERN)
+            )
 
-            if now >= next_deadline:
-                new_carryover.append(idx)  # re-missed -> push to next day tail
+
+            # Evening picks are one-hour windows: deadline is always start + 1 hour
+            next_deadline = slot_dt + timedelta(hours=1)
+
+            # Re-miss rule:
+            #  - If the slot was on a previous calendar day relative to 'now', it is already re-missed.
+            #  - Else (same day), compare 'now' to the computed next_deadline as usual.
+            slot_date = slot_dt.astimezone(EASTERN).date()
+            re_missed = (slot_date < now_local_date) or (now >= next_deadline)
+
+            if re_missed:
+                new_carryover.append(idx)  # will be placed at the next day's evening tail
             else:
                 scheduled_time[idx] = slot_dt
 
         carryover_eod = new_carryover
         day = next_non_sunday_date(day + timedelta(days=1))
         safety_days += 1
-    # Any leftovers: put on the next day 7pm onwards (extreme backstop)
+
+    # Any leftovers → next non-Sunday day's evening tail
     if carryover_eod:
         nd = next_non_sunday_date(day)
         for j, idx in enumerate(carryover_eod):
@@ -564,6 +510,16 @@ def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
 
 @order_bp.route("/order")
 def order_page():
+    # opportunistic enforcement so opening this page processes outstanding picks
+    try:
+        from baseball import enforce_queue_actions  # local import avoids circular at module import time
+        enforce_queue_actions()
+    except Exception as _e:
+        # log to Flask logger
+        try:
+            current_app.logger.exception("[order] enforce_queue_actions failed: %s", _e)
+        except Exception:
+            pass
     # pagination
     try:
         page = max(1, int(request.args.get("page", "1")))
@@ -599,6 +555,16 @@ def order_page():
 
 @order_bp.get("/api/order")
 def api_order():
+# opportunistic enforcement so opening this page processes outstanding picks
+    try:
+        from baseball import enforce_queue_actions  # local import avoids circular at module import time
+        enforce_queue_actions()
+    except Exception as _e:
+        # log to Flask logger
+        try:
+            current_app.logger.exception("[order] enforce_queue_actions failed: %s", _e)
+        except Exception:
+            pass
     try:
         page = max(1, int(request.args.get("page", "1")))
     except ValueError:

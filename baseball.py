@@ -55,11 +55,14 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List
-from draft_order_page import order_bp
+from draft_order_page import order_bp, EASTERN, next_non_sunday_date, END_OF_DAY_MISS_HOUR
+
 import unicodedata
 from flask import (
     Flask, request, jsonify, session, redirect, url_for, render_template_string, abort
 )
+import logging
+
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -81,6 +84,9 @@ app = Flask(__name__)
 app.config["DB_PATH"] = str(DB_PATH)   # blueprint reads this
 app.register_blueprint(order_bp)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "bnsldraftsecretkey")
+
+logging.basicConfig(level=logging.INFO)
+app.logger.setLevel(logging.INFO)
 
 MLB_TEAMS = [
     "Arizona Diamondbacks","Atlanta Braves","Baltimore Orioles","Boston Red Sox",
@@ -182,21 +188,41 @@ def get_team_queue(team: str) -> list[sqlite3.Row]:
     return rows
 
 def get_team_queue_top_available(team: str) -> int | None:
+    """
+    Return the first *available & eligible* player in this team's draft_queue,
+    scanning in true queue order (position ASC, then FIFO).
+    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT p.id
+        SELECT dq.player_id
           FROM draft_queue dq
-          JOIN players p ON p.id = dq.player_id
          WHERE dq.team = ?
-           AND (p.franchise IS NULL OR p.franchise = '')
-           AND COALESCE(p.eligible,1) = 1
          ORDER BY dq.position ASC, dq.id ASC
-         LIMIT 1
     """, (team,))
-    row = cur.fetchone()
+    pids = [int(r[0]) for r in cur.fetchall()]
+    if not pids:
+        conn.close()
+        return None
+
+    qmarks = ",".join("?" for _ in pids)
+    cur.execute(f"""
+        SELECT id, franchise, COALESCE(eligible,1) AS eligible
+          FROM players
+         WHERE id IN ({qmarks})
+    """, pids)
+    by_id = {int(r["id"]): r for r in cur.fetchall()}
+
+    for pid in pids:
+        row = by_id.get(pid)
+        if not row:
+            continue
+        if (not row["franchise"]) and int(row["eligible"] or 0) == 1:
+            conn.close()
+            return pid
     conn.close()
-    return int(row[0]) if row else None
+    return None
+
 
 def set_queue_mode(team: str, use_at_start: bool):
     conn = get_conn()
@@ -249,91 +275,49 @@ def perform_draft_internal(team: str, player_id: int, draft_order_id: int) -> No
     # clean queues
     remove_player_from_all_queues(player_id)
 
-def enforce_queue_actions():
+def get_team_queue_top_available(team: str) -> int | None:
     """
-    Auto-draft from queues in two phases:
-
-    1) END-OF-CLOCK (default): find the earliest undrafted pick *by order*
-       whose deadline (next pick’s designated time) is in the past. If that
-       team uses end-of-clock mode and has a queued player, draft them now.
-
-    2) START-OF-CLOCK: for the team currently on the clock, if they use
-       start-of-clock and have a queued player, draft immediately.
+    Return the first *available & eligible* player in this team's draft_queue,
+    scanning in true queue order (position ASC, then FIFO).
     """
-    # Use helpers from the order blueprint (we already depend on it)
-    from draft_order_page import (
-        _load_picks_overrides_and_designated,
-        get_current_pick_info,
-        EASTERN,
-    )
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT dq.player_id
+          FROM draft_queue dq
+         WHERE dq.team = ?
+         ORDER BY dq.position ASC, dq.id ASC
+    """, (team,))
+    pids = [int(r[0]) for r in cur.fetchall()]
+    if not pids:
+        conn.close()
+        return None
 
-    now = datetime.now(tz=EASTERN)
+    qmarks = ",".join("?" for _ in pids)
+    cur.execute(f"""
+        SELECT id, franchise, COALESCE(eligible,1) AS eligible
+          FROM players
+         WHERE id IN ({qmarks})
+    """, pids)
+    by_id = {int(r["id"]): r for r in cur.fetchall()}
 
-    # Load ordered picks and their designated times (override-or-base)
-    picks, designated = _load_picks_overrides_and_designated()
-    if not picks:
-        return
+    for pid in pids:
+        row = by_id.get(pid)
+        if not row:
+            continue
+        if (not row["franchise"]) and int(row["eligible"] or 0) == 1:
+            conn.close()
+            return pid
+    conn.close()
+    return None
 
-    # Build the "next pick deadline" array
-    next_deadlines = []
-    for i in range(len(picks)):
-        if i + 1 < len(picks):
-            next_deadlines.append(designated[i + 1])
-        else:
-            # last pick effectively never misses
-            next_deadlines.append(designated[i] + timedelta(days=36500))
-
-    # ---- Phase 1: END-OF-CLOCK enforcement (critical bugfix) ----
-    # Scan in strict order; if the earliest undrafted pick is past its deadline,
-    # and that team uses end mode and has a queued player, draft it now.
-    for i, rec in enumerate(picks):
-        if rec["player_id"]:
-            continue  # already drafted
-        deadline = next_deadlines[i]
-        if now >= deadline:
-            team = rec["team"]
-            if not get_queue_mode(team):  # False => end-of-clock (default)
-                pid = get_team_queue_top_available(team)
-                if pid:
-                    try:
-                        perform_draft_internal(team, pid, int(rec["id"]))
-                    finally:
-                        # Advance notifications; failures shouldn’t block the draft
-                        try:
-                            notify_if_new_on_clock()
-                        except Exception as e:
-                            print(f"[notify] failed: {e}")
-            # Only ever process a single pick per enforcement tick
-            break
-
-    # ---- Phase 2: START-OF-CLOCK enforcement ----
-    info = get_current_pick_info()
-    if not info:
-        # Also refresh notifications so UI/email can reflect completion
-        try:
-            notify_if_new_on_clock()
-        except Exception as e:
-            print(f"[notify] failed: {e}")
-        return
-
-    team = info["team"]
-    if get_queue_mode(team):  # True => use at start
-        pid = get_team_queue_top_available(team)
-        if pid:
-            try:
-                perform_draft_internal(team, pid, int(info["id"]))
-            finally:
-                try:
-                    notify_if_new_on_clock()
-                except Exception as e:
-                    print(f"[notify] failed: {e}")
-    else:
-        # Even if no auto-draft occurred, a miss may have advanced the clock.
-        try:
-            notify_if_new_on_clock()
-        except Exception as e:
-            print(f"[notify] failed: {e}")
-
+def _team_queue_count(team: str) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM draft_queue WHERE team=?", (team,))
+    n = int(cur.fetchone()[0] or 0)
+    conn.close()
+    return n
 
 def get_meta(key: str) -> str | None:
     conn = get_conn()
@@ -1000,6 +984,146 @@ def normalized_header_map(header: List[str]) -> Dict[str, int]:
 def normalize_team(name: str) -> str:
     n = (name or "").strip()
     return OWNER_TO_FULL.get(n, n)
+
+def enforce_queue_actions():
+    """
+    Priority:
+      1) END-OF-CLOCK: For any pick whose DESIGNATED deadline has arrived/passed,
+         try drafting from that team's queue (in scheduled/designated order).
+      2) START-OF-CLOCK: If nothing happened, and the current pick's scheduled
+         time has arrived, auto-draft from queue if team has use_queue_at_start=1.
+    """
+    from draft_order_page import (
+        _load_picks_overrides_and_designated,
+        _compute_scheduled_times,
+        get_current_pick_info,
+        EASTERN,
+    )
+
+    safety = 0
+    while safety < 50:
+        safety += 1
+        progressed = False
+        now = datetime.now(tz=EASTERN)
+
+        try:
+            picks, designated = _load_picks_overrides_and_designated()
+            if not picks:
+                app.logger.info("[enforce] no picks; exiting")
+                break
+            scheduled = _compute_scheduled_times(now)
+        except Exception as e:
+            app.logger.exception("[enforce] schedule compute failed: %s", e)
+            break
+
+        # ---------- 1) END-OF-CLOCK FIRST (deadline passed → try queue) ----------
+        undrafted = [i for i, r in enumerate(picks) if not r["player_id"]]
+        if not undrafted:
+            app.logger.info("[enforce] draft complete; exiting")
+            break
+
+        # Order by DESIGNATED time so deadlines match the /order miss logic
+        ordered = sorted(undrafted, key=lambda i: (designated[i], i))
+
+        far = now + timedelta(days=36500)
+        deadline_by_idx = {}
+        for pos, i in enumerate(ordered):
+            if pos + 1 < len(ordered):
+                nxt = ordered[pos + 1]
+                deadline_by_idx[i] = designated[nxt]
+            else:
+                deadline_by_idx[i] = far
+
+        acted_this_pass = False
+        for i in ordered:
+            dl = deadline_by_idx[i]
+            if now < dl:
+                # nothing later is overdue (ordered by designated time)
+                break
+
+            rec = picks[i]
+            team = rec["team"]
+            pid = get_team_queue_top_available(team)
+            app.logger.info(
+                "[enforce] OVERDUE(designated) pick_id=%s team=%s designated=%s deadline=%s now=%s top_from_queue=%s",
+                rec["id"], team,
+                designated[i].isoformat(timespec="minutes"),
+                dl.isoformat(timespec="minutes"),
+                now.isoformat(timespec="minutes"),
+                pid
+            )
+            if pid:
+                try:
+                    perform_draft_internal(team, pid, int(rec["id"]))
+                except Exception as e:
+                    app.logger.exception(
+                        "[enforce] perform_draft_internal failed (MISS->QUEUE) team=%s pick_id=%s pid=%s: %s",
+                        team, rec["id"], pid, e
+                    )
+                else:
+                    acted_this_pass = True
+                    progressed = True
+                    break  # state changed; recompute whole state
+
+        if acted_this_pass:
+            continue  # loop, recompute everything from DB/state
+
+        # ---------- KEY CHANGE: refresh schedule once, then evaluate START-OF-CLOCK ----------
+        # We *do not* bail out just because we saw overdue items with no queue action.
+        # Instead, recompute the scheduled map so any evening re-miss (e.g., DET) is rolled
+        # to TOMORROW's evening tail *before* we consider a start-of-clock auto-pick.
+        try:
+            scheduled = _compute_scheduled_times(now)  # refresh using the same 'now'
+        except Exception as e:
+            app.logger.exception("[enforce] _compute_scheduled_times refresh failed: %s", e)
+            # If refresh fails, fall back to the previously computed 'scheduled'
+
+
+        # ---------- 2) START-OF-CLOCK (only if nothing overdue fired) ----------
+        try:
+            info = get_current_pick_info()
+        except Exception as e:
+            app.logger.exception("[enforce] get_current_pick_info failed: %s", e)
+            info = None
+
+        if info:
+            cur_idx = None
+            for i, r in enumerate(picks):
+                if r["id"] == info["id"]:
+                    cur_idx = i
+                    break
+
+            if cur_idx is not None:
+                team = picks[cur_idx]["team"]
+                sched_t = scheduled.get(cur_idx, designated[cur_idx])
+                # Gate start-of-clock on actual start time to avoid early drafting
+                if now >= sched_t and get_queue_mode(team):
+                    app.logger.info(
+                        "[enforce] START-OF-CLOCK team=%s pick_id=%s sched=%s now=%s",
+                        team, info["id"],
+                        sched_t.isoformat(timespec="minutes"),
+                        now.isoformat(timespec="minutes"),
+                    )
+                    pid = get_team_queue_top_available(team)
+                    if pid:
+                        try:
+                            perform_draft_internal(team, pid, int(info["id"]))
+                        except Exception as e:
+                            app.logger.exception(
+                                "[enforce] perform_draft_internal failed (START->QUEUE) team=%s pick_id=%s pid=%s: %s",
+                                team, info["id"], pid, e
+                            )
+                        else:
+                            progressed = True
+
+        if not progressed:
+            break
+
+    # Notify after enforcement
+    try:
+        notify_if_new_on_clock()
+    except Exception as e:
+        app.logger.exception("[enforce] notify_if_new_on_clock failed: %s", e)
 
 
 def import_players_from_csv(path: Path):
@@ -2038,6 +2162,25 @@ def api_players():
             "in_queue": (r["id"] in in_queue),
         })
     return jsonify({"players": players})
+
+@app.get("/api/debug/schedule_snapshot")
+def debug_schedule_snapshot():
+    from draft_order_page import _load_picks_overrides_and_designated, _compute_scheduled_times, EASTERN
+    now = datetime.now(tz=EASTERN)
+    picks, designated = _load_picks_overrides_and_designated()
+    scheduled = _compute_scheduled_times(now)
+    out = []
+    for i, r in enumerate(picks):
+        if r["player_id"]:
+            continue
+        out.append({
+            "id": r["id"],
+            "label": r["label"] or f"{r['round']}.{r['pick']:02d}",
+            "team": r["team"],
+            "designated": designated[i].isoformat(),
+            "scheduled": scheduled.get(i, designated[i]).isoformat(),
+        })
+    return jsonify({"now": now.isoformat(), "undrafted": out})
 
 
 @app.post("/tasks/enforce_queue")
