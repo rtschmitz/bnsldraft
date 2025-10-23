@@ -309,7 +309,13 @@ def enforce_queue_actions():
     # ---- Phase 2: START-OF-CLOCK enforcement ----
     info = get_current_pick_info()
     if not info:
+        # Also refresh notifications so UI/email can reflect completion
+        try:
+            notify_if_new_on_clock()
+        except Exception as e:
+            print(f"[notify] failed: {e}")
         return
+
     team = info["team"]
     if get_queue_mode(team):  # True => use at start
         pid = get_team_queue_top_available(team)
@@ -321,6 +327,12 @@ def enforce_queue_actions():
                     notify_if_new_on_clock()
                 except Exception as e:
                     print(f"[notify] failed: {e}")
+    else:
+        # Even if no auto-draft occurred, a miss may have advanced the clock.
+        try:
+            notify_if_new_on_clock()
+        except Exception as e:
+            print(f"[notify] failed: {e}")
 
 
 def get_meta(key: str) -> str | None:

@@ -512,14 +512,23 @@ def _compute_scheduled_times(now: datetime) -> Dict[int, datetime]:
             scheduled_time[i] = designated[i]
 
     # Evening queues day-by-day, with carryover for re-misses
-    day = next_non_sunday_date(now.date())
+    # IMPORTANT: start from the earliest designated day (same as compute_rows),
+    # not "today", so we actually process yesterday's (or earlier) misses.
+    if designated:
+        earliest_day = next_non_sunday_date(min(designated).astimezone(EASTERN).date())
+    else:
+        earliest_day = next_non_sunday_date(DRAFT_START.date())
+    day = earliest_day
+
 
 
     carryover_eod: List[int] = []
     safety_days = 0
     while len(scheduled_time) < len(undrafted_idxs) and safety_days < 3650:
         todays_misses = missed_by_day.get((day.year, day.month, day.day), [])
-        todays_misses.sort(key=lambda idx: designated[idx])   # NEW
+        # Ensure stable ordering within the day by original designated time
+        todays_misses.sort(key=lambda idx: designated[idx])
+
         evening_queue = todays_misses + carryover_eod
         new_carryover: List[int] = []
 
