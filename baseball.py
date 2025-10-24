@@ -174,18 +174,39 @@ def remove_player_from_all_queues(player_id: int):
     conn.close()
 
 def get_team_queue(team: str) -> list[sqlite3.Row]:
+    """
+    Return this team's queue in queue order, including full player fields
+    so the queue page can render the same columns as the main page.
+    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT dq.player_id, dq.position, p.name
-          FROM draft_queue dq
-          JOIN players p ON p.id = dq.player_id
-         WHERE dq.team = ?
-         ORDER BY dq.position ASC, dq.id ASC
+        SELECT
+            dq.player_id,
+            dq.position AS qpos,
+            p.name,
+            p.dob,
+            p.position,
+            p.franchise,
+            COALESCE(p.eligible, 1) AS eligible,
+            p.mlbamid,
+            p.bats,
+            p.throws,
+            p.dob_month,
+            p.dob_day,
+            p.dob_year,
+            p.mlb_org,
+            p.fg_30, p.fg_fv, p.mlb_30, p.mlb_fv, p.fg100, p.mlb100
+        FROM draft_queue dq
+        JOIN players p ON p.id = dq.player_id
+        WHERE dq.team = ?
+        ORDER BY dq.position ASC, dq.id ASC
     """, (team,))
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
 
 def get_team_queue_top_available(team: str) -> int | None:
     """
@@ -1376,14 +1397,16 @@ QUEUE_HTML = r"""
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
     a { color: #184a7d; text-decoration: none; }
-    .pill { padding: 6px 10px; border-radius: 999px; background: #f2f2f2; display: inline-block; }
+    .pill { padding: 6px 10px; border-radius: 999px; background: #f2f2f2; display: inline-flex; gap:8px; align-items:center; }
     .btn { padding: 6px 10px; border: 1px solid #333; background: #fff; border-radius: 6px; cursor: pointer; }
     .btn[disabled]{opacity:.5; cursor:not-allowed;}
-    ul { list-style: none; padding: 0; }
-    li { display:flex; align-items:center; gap:8px; padding:8px 10px; border-bottom:1px solid #eee; }
-    .name { flex: 1; }
+    .row { display:flex; gap:16px; align-items:center; margin:12px 0; flex-wrap:wrap; }
+    .muted { color:#666; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border-bottom: 1px solid #e5e5e5; padding: 8px 10px; text-align: left; }
+    th { background: #fafafa; position: sticky; top: 0; z-index: 1; }
     .controls { display:flex; gap:6px; }
-    .row { display:flex; gap:16px; align-items:center; margin:12px 0; flex-wrap:wrap;}
+    .owned { opacity: 0.45; }
   </style>
 </head>
 <body>
@@ -1401,12 +1424,34 @@ QUEUE_HTML = r"""
       <input type="radio" name="mode" id="mode-end"> Use queue at end of clock (default)
     </label>
     <button id="save-mode" class="btn">Save Mode</button>
+    <span class="muted">Queue order is top → bottom.</span>
   </div>
 
-  <ul id="queue-list"></ul>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:6%;">#</th>
+        <th style="width:7%;">MLBAMID</th>
+        <th style="width:18%;">Name</th>
+        <th style="width:6%;">Bats</th>
+        <th style="width:6%;">Throws</th>
+        <th style="width:7%;">Pos</th>
+        <th style="width:12%;">DOB</th>
+        <th style="width:14%;">MLB Org</th>
+        <th style="width:6%;">FG 30</th>
+        <th style="width:6%;">FG FV</th>
+        <th style="width:6%;">MLB 30</th>
+        <th style="width:6%;">MLB FV</th>
+        <th style="width:6%;">FG100</th>
+        <th style="width:6%;">MLB100</th>
+        <th style="width:10%;">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="queue-body"></tbody>
+  </table>
 
   <script>
-    const list = document.getElementById('queue-list');
+    const tbody = document.getElementById('queue-body');
     const saveModeBtn = document.getElementById('save-mode');
     const modeStart = document.getElementById('mode-start');
     const modeEnd = document.getElementById('mode-end');
@@ -1435,18 +1480,75 @@ QUEUE_HTML = r"""
       render();
     }
 
+    function show(x){ return (x === null || x === undefined) ? '' : x; }
+
+    function dobText(p){
+      if (p.dob && p.dob.length) return p.dob;
+      if (p.dob_year && p.dob_month && p.dob_day) {
+        const y = String(p.dob_year).padStart(4,'0');
+        const m = String(p.dob_month).padStart(2,'0');
+        const d = String(p.dob_day).padStart(2,'0');
+        return `${y}-${m}-${d}`;
+      }
+      return '';
+    }
+
     function render() {
       teamPill.textContent = team ? ('Team: ' + team) : '';
       modeStart.checked = useStart;
       modeEnd.checked = !useStart;
 
-      list.innerHTML = '';
-      queue.forEach((item, idx) => {
-        const li = document.createElement('li');
-        const name = document.createElement('div');
-        name.className = 'name';
-        name.textContent = `${idx+1}. ${item.name}`;
+      tbody.innerHTML = '';
+      queue.forEach((p, idx) => {
+        const tr = document.createElement('tr');
+        if (p.franchise) tr.classList.add('owned');
 
+        // index / queue position
+        const tdIdx = document.createElement('td');
+        tdIdx.textContent = String(idx + 1);
+
+        const tdMlbamid = document.createElement('td');
+        tdMlbamid.textContent = show(p.mlbamid);
+
+        const tdName = document.createElement('td');
+        tdName.textContent = p.name || '';
+
+        const tdBats = document.createElement('td');
+        tdBats.textContent = p.bats || '';
+
+        const tdThrows = document.createElement('td');
+        tdThrows.textContent = p.throws || '';
+
+        const tdPos = document.createElement('td');
+        tdPos.textContent = p.position || '';
+
+        const tdDob = document.createElement('td');
+        tdDob.textContent = dobText(p);
+
+        const tdOrg = document.createElement('td');
+        tdOrg.textContent = p.mlb_org || '';
+
+        const tdFg30 = document.createElement('td');
+        tdFg30.textContent = show(p.fg_30);
+
+        const tdFgFv = document.createElement('td');
+        tdFgFv.textContent = show(p.fg_fv);
+
+        const tdMlb30 = document.createElement('td');
+        tdMlb30.textContent = show(p.mlb_30);
+
+        const tdMlbFv = document.createElement('td');
+        tdMlbFv.textContent = show(p.mlb_fv);
+
+        const tdFg100 = document.createElement('td');
+        tdFg100.textContent = show(p.fg100);
+
+        const tdMlb100 = document.createElement('td');
+        tdMlb100.textContent = show(p.mlb100);
+
+        const tdAct = document.createElement('td');
+        const ctrls = document.createElement('div');
+        ctrls.className = 'controls';
         const up = document.createElement('button');
         up.className = 'btn';
         up.textContent = '↑';
@@ -1456,23 +1558,36 @@ QUEUE_HTML = r"""
         const down = document.createElement('button');
         down.className = 'btn';
         down.textContent = '↓';
-        down.disabled = idx === queue.length-1;
+        down.disabled = idx === queue.length - 1;
         down.onclick = () => move(idx, +1);
 
         const del = document.createElement('button');
         del.className = 'btn';
         del.textContent = 'Remove';
-        del.onclick = () => remove(item.player_id);
+        del.onclick = () => remove(p.player_id);
 
-        const ctrls = document.createElement('div');
-        ctrls.className = 'controls';
         ctrls.appendChild(up);
         ctrls.appendChild(down);
         ctrls.appendChild(del);
+        tdAct.appendChild(ctrls);
 
-        li.appendChild(name);
-        li.appendChild(ctrls);
-        list.appendChild(li);
+        tr.appendChild(tdIdx);
+        tr.appendChild(tdMlbamid);
+        tr.appendChild(tdName);
+        tr.appendChild(tdBats);
+        tr.appendChild(tdThrows);
+        tr.appendChild(tdPos);
+        tr.appendChild(tdDob);
+        tr.appendChild(tdOrg);
+        tr.appendChild(tdFg30);
+        tr.appendChild(tdFgFv);
+        tr.appendChild(tdMlb30);
+        tr.appendChild(tdMlbFv);
+        tr.appendChild(tdFg100);
+        tr.appendChild(tdMlb100);
+        tr.appendChild(tdAct);
+
+        tbody.appendChild(tr);
       });
     }
 
@@ -1520,6 +1635,8 @@ QUEUE_HTML = r"""
 </body>
 </html>
 """
+
+
 
 @app.route("/queue")
 def queue_page():
@@ -2024,11 +2141,37 @@ def _require_authed_team():
 def api_queue_get():
     team = _require_authed_team()
     rows = get_team_queue(team)
+    items = []
+    for r in rows:
+        items.append({
+            "player_id":   int(r["player_id"]),
+            "qpos":        int(r["qpos"] or 0),
+            "name":        r["name"],
+            "dob":         r["dob"],
+            "position":    r["position"],
+            "franchise":   r["franchise"],
+            "eligible":    int(r["eligible"] or 1),
+            "mlbamid":     r["mlbamid"],
+            "bats":        r["bats"],
+            "throws":      r["throws"],
+            "dob_month":   r["dob_month"],
+            "dob_day":     r["dob_day"],
+            "dob_year":    r["dob_year"],
+            "mlb_org":     r["mlb_org"],
+            "fg_30":       r["fg_30"],
+            "fg_fv":       r["fg_fv"],
+            "mlb_30":      r["mlb_30"],
+            "mlb_fv":      r["mlb_fv"],
+            "fg100":       r["fg100"],
+            "mlb100":      r["mlb100"],
+        })
     return jsonify({
         "team": team,
         "use_at_start": get_queue_mode(team),
-        "items": [{"player_id": r["player_id"], "name": r["name"], "position": r["position"]} for r in rows],
+        "items": items,
     })
+
+
 
 @app.post("/api/queue/add")
 def api_queue_add():
